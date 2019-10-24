@@ -24,9 +24,9 @@
 // Defined constants
 #define DEBUG                 // Comment to disable debug messages
 //#define DEBUG_I2C             // Comment to disable I2C debug messages
-#define DEBUG_NMEA
+//#define DEBUG_NMEA
 //#define DEBUG_SERIAL_BUFFER   // Comment to disable Serial buffer messages
-//#define DEBUG_UBX
+#define DEBUG_UBX
 #define LED_PIN       8
 #define RTC_INT_PIN   5
 #define SW_PIN        A0      // Press to stop logging and close the log file
@@ -351,8 +351,8 @@ void loop() {
 #ifdef DEBUG
         Serial.println("case START_UBX:");
 #endif
-        enableNmea();
-        //enableUbx();          // Enable UBX RAWX and SFRBX messages
+        //enableNmea();
+        enableUbx();          // Enable UBX RAWX and SFRBX messages
         bufferPointer = 0;    // Initialize bufferPointer
         loopStep = OPEN_FILE; // Open log file
       } // end case START_UBX:
@@ -826,8 +826,8 @@ void loop() {
         Serial.println("case CLOSE_FILE:");
 #endif
         // Disable RAWX messages, save any residual data and close the log file
-        //disableUbx(); // Disable UBX RAWX and SFRBX messages
-        disableNmea();
+        disableUbx(); // Disable UBX RAWX and SFRBX messages
+        //disableNmea();
         // Wait for residual data
         uint16_t dwellCounter = 0;
         while (dwellCounter < dwell) {
