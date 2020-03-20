@@ -4,8 +4,9 @@
   Author:   Adam Garbo
 
   Description:
-  - Based on the u-blox ZED-F9P, this data logger records UBX-RAWX and UBX-SFRBX directly to 
-  the Adafruit M0 Adalogger.
+  - Logs RXM-RAWX, RXM-SFRBX and TIM-TM2 data from u-blox ZED_F9P GNSS to SD card
+  - Also logs NAV_PVT messages (which provide the carrSoln status) and NAV-STATUS messages (which indicate a time fix for Survey_In mode)
+  - Also logs high precision NMEA GNGGA position solution messages which can be extracted by RTKLIB
 
   Components:
   - Adafruit Feather M0 Adalogger
@@ -13,93 +14,77 @@
   - SparkFun GPS-RTK2 Board ZED-F9P
 
   Comments:
-  - This code is based heavily on Paul Clark's F9P_RAWX_Logger:
+  This code is based heaivly on Paul Clark's F9P_RAWX_Logger:
   https://github.com/PaulZC/ZED-F9P_FeatherWing_USB
-  - The code has been streamlined and functionality to output raw UBX data to the Serial Monitor.
-  - This code is currently being developed further to handle sync losses without needing to create new log files.
 */
 
 // Libraries
 #include <ArduinoLowPower.h>                // https://github.com/arduino-libraries/ArduinoLowPower
-#include <DS3232RTC.h>                      // https://github.com/JChristensen/DS3232RTC
+#include <RTCZero.h>                        // https://github.com/arduino-libraries/RTCZero
 #include <SdFat.h>                          // https://github.com/greiman/SdFat
 #include <SparkFun_Ublox_Arduino_Library.h> // https://github.com/sparkfun/SparkFun_Ublox_Arduino_Library
 #include <SPI.h>                            // https://www.arduino.cc/en/Reference/SPI
 #include <Wire.h>                           // https://www.arduino.cc/en/Reference/Wire
 
 // Debugging definitons
-#define DEBUG                 true  // Debugging output to Serial Monitor
-#define DEBUG_I2C             true  // I2C debugging output to Serial Monitor
-#define DEBUG_NMEA            false // NMEA debugging output to Serial Monitor
-#define DEBUG_SERIAL_BUFFER   false // Displays a message each time SerialBuffer.available reaches a new maximum
-#define DEBUG_UBX             true  // UBX debugging output to Serial Monitor
+#define DEBUG               true  // Debugging output to Serial Monitor
+#define DEBUG_I2C           false // I2C debugging output to Serial Monitor
+#define DEBUG_NMEA          false // NMEA debugging output to Serial Monitor
+#define DEBUG_SERIAL_BUFFER false // Displays a message each time SerialBuffer.available reaches a new maximum
+#define DEBUG_UBX           false // UBX debugging output to Serial Monitor
+#define NO_LED              false // Disable all LEDs
 
-// Pin definitions
-#define LED_PIN       8
-#define RTC_INT_PIN   5
-#define SW_PIN        A0  // Press to halt logging and close the log file
+// Pin assignments
+#define LED_PIN     8   // Indicates that the GNSS has established a fix
+#define MODE_PIN    6  // Connect MODE_PIN to GND to select base mode. Leave open for rover mode.
+#define SURVEY_PIN  A3  // Connect to GND to select SURVEY_IN mode when in BASE mode
+#define SW_PIN      10  // Connect a normally-open push-to-close switch between SW_PIN and GND to halt logging and close the log file
 
-// Instantiate objects
-DS3232RTC           myRTC(false); // Tell constructor not to initialize the I2C bus
-RingBufferN<16384>  SerialBuffer; // Define SerialBuffer as a RingBuffer of size 16k bytes
-SdFat               sd;
-SdFile              file;
-SFE_UBLOX_GPS       myGPS;
+// Object instantiations
+RTCZero       rtc;
+SdFat         sd;
+SdFile        file;
+SFE_UBLOX_GPS gnss;
 
 // User-declared global variables and constants
-const uint32_t  alarmInterval   = 60;   // Duration of log file before new file is created
-const float     lowBattery      = 3.5;  // Low battery voltage threshold
+const int alarmInterval = 5; // Creates a new log file every alarmInterval minutes
 
-// Declare global variables and constants
-const size_t    sdPacket            = 512;    // SD packet size
-const uint16_t  dwell               = 1000;   // Time to wait (in milliseconds) for residual data before closing the log file
-const uint8_t   chipSelect          = 4;      // SD card chip select
-volatile bool   alarmFlag           = false;  // RTC alarm interrupt service routine (ISR) flag
-bool            stopPressed         = false;  // Flag to indicate if stop switch was pressed to halt logging
-char            dirName[9]          = {0};    // Log file directory name buffer (YYYYMMDD)
-char            fileName[22]        = {0};    // Log file name format limited to 8.3 characters: YYYYMMDD/HHMMSS.ubx
-char            dataString[4]       = {0};
-float           voltage             = 0.0;    // Battery voltage
-uint8_t         maxValFix           = 5;      // Maximum number of valid GNSS fixes to be collected
-uint8_t         serBuffer[sdPacket];          // Buffer
-uint8_t         valFix              = 0;      // GNSS valid fix counter
-int16_t         maxBufferAvailable  = 0;      // SerialBuffer debugging
-uint16_t        numBytes            = 0;      //
-uint32_t        bytesWritten        = 0;      //
-size_t          bufferPointer       = 0;      // Buffer pointer
-time_t          t, alarmTime;
-tmElements_t    tm;
+// Define how long we should wait in msec (approx.) for residual RAWX data before closing the last log file
+// For a measurement rate of 4Hz (250msec), 300msec is a sensible value. i.e. slightly more than one measurement interval
+const int dwell = 300;
 
-// Global Variables for UBX/NMEA Parsing
-const uint8_t ubxSyncChar1          = 0xB5;
-const uint8_t ubxSyncChar2          = 0x62;
-uint8_t       ubxClass              = 0;
-uint8_t       ubxId                 = 0;
-uint16_t      ubxLength             = 0;
-uint8_t       ubxChecksumA          = 0;
-uint8_t       ubxChecksumB          = 0;
-uint8_t       ubxExpectedChecksumA  = 0;
-uint8_t       ubxExpectedChecksumB  = 0;
-uint8_t       nmeaAddress1          = '0'; // e.g. G
-uint8_t       nmeaAddress2          = '0'; // e.g. P
-uint8_t       nmeaAddress3          = '0'; // e.g. G
-uint8_t       nmeaAddress4          = '0'; // e.g. G
-uint8_t       nmeaAddress5          = '0'; // e.g. A
-uint8_t       nmeaChecksum          = 0;
-uint8_t       nmeaChecksum1         = '0';
-uint8_t       nmeaChecksum2         = '0';
-uint8_t       nmeaExpectedChecksum1 = '0';
-uint8_t       nmeaExpectedChecksum2 = '0';
-const uint8_t nmeaMaxLength         = 100; // Max NMEA message length used to detect if sync is lost
+// Global flag variable delcarations
+volatile bool alarmFlag   = false;  // RTC alarm interrupt service routine flag
+bool          stopFlag    = false;  // Flag to indicate if stop switch was pressed to stop logging
+bool          surveyFlag  = false;  // Flag to indicate if the code is in survey_in mode
+bool          modeFlag    = true;   // Flag to indicate if the code is in base or rover mode
+bool          ledState    = LOW;    // Flag to toggle LED in blinkLed() function
+
+// Global variables and constant declarations
+const uint8_t chipSelect    = 4;                     // SD card chip select
+char          fileName[]    = "YYYYMMDD/HHMMSS.ubx"; // Log file name. Format limited to 8.3 characters
+char          dirName[]     = "YYYYMMDD";             // Log file directory name
+long          bytesWritten  = 0;
+const size_t  sdPacket      = 512;    // Define packet size,
+uint8_t       serBuffer[sdPacket];    // buffer and buffer pointer for SD card writes
+size_t        bufferPointer = 0;
+int           numBytes;
+float         voltage       = 0.0;    // Battery voltage
+const float   lowVoltage    = 3.55;   // Low battery voltage
+int           maxSerialBufferAvailable = 0;
+int           maxValFix     = 5;      // Number of valid GNSS fixes to collect before starting to log
+int           valFix        = 0;
+uint32_t      previousMillis = 0;
 
 // Enumerated switch statements
 enum LoopSwitch {
-  START,
+  INIT,
   START_UBX,
   OPEN_FILE,
   WRITE_FILE,
   NEW_FILE,
   CLOSE_FILE,
+  RESTART_FILE,
   SLEEP,
   WAKE
 };
@@ -123,281 +108,533 @@ enum ParseSwitch {
 };
 
 // Default switch steps
-LoopSwitch  loopStep  = START;
+LoopSwitch loopStep = INIT;
 ParseSwitch parseStep = PARSE_UBX_SYNC_CHAR_1;
 
-// Satellite systems (GNSS) signal configuration
-// Enable GPS/GLO and disable GAL/BDS/QZSS
-uint8_t configureGnss() {
-  myGPS.newCfgValset8(0x1031001f, 0x01, VAL_LAYER_RAM); // CFG-SIGNAL-GPS_ENA
-  myGPS.addCfgValset8(0x10310001, 0x01);                // CFG-SIGNAL-GPS_L1CA_ENA
-  myGPS.addCfgValset8(0x10310003, 0x01);                // CFG-SIGNAL-GPS_L2C_ENA
-  myGPS.addCfgValset8(0x10310021, 0x00);                // CFG-SIGNAL-GAL_ENA
-  myGPS.addCfgValset8(0x10310007, 0x00);                // CFG-SIGNAL-GAL_E1_ENA
-  myGPS.addCfgValset8(0x1031000a, 0x00);                // CFG-SIGNAL-GAL_E5B_ENA
-  myGPS.addCfgValset8(0x10310022, 0x00);                // CFG-SIGNAL-BDS_ENA
-  myGPS.addCfgValset8(0x1031000d, 0x00);                // CFG-SIGNAL-BDS_B1_ENA
-  myGPS.addCfgValset8(0x1031000e, 0x00);                // CFG-SIGNAL-BDS_B2_ENA
-  myGPS.addCfgValset8(0x10310024, 0x00);                // CFG-SIGNAL-QZSS_ENA
-  myGPS.addCfgValset8(0x10310012, 0x00);                // CFG-SIGNAL-QZSS_L1CA_ENA
-  myGPS.addCfgValset8(0x10310015, 0x00);                // CFG-SIGNAL-QZSS_L2C_ENA
-  myGPS.addCfgValset8(0x10310025, 0x01);                // CFG-SIGNAL-GLO_ENA
-  myGPS.addCfgValset8(0x10310018, 0x01);                // CFG-SIGNAL-GLO_L1_ENA
-  return myGPS.sendCfgValset8(0x1031001a, 0x01);        // CFG-SIGNAL-GLO_L2_ENA
+// Global variables for UBX/NMEA parsing
+int ubxLength             = 0;
+int ubxClass              = 0;
+int ubxId                 = 0;
+int ubxChecksumA          = 0;
+int ubxChecksumB          = 0;
+int ubxExpectedChecksumA  = 0;
+int ubxExpectedChecksumB  = 0;
+int nmeaAddress1          = '0'; // e.g. G
+int nmeaAddress2          = '0'; // e.g. P
+int nmeaAddress3          = '0'; // e.g. G
+int nmeaAddress4          = '0'; // e.g. G
+int nmeaAddress5          = '0'; // e.g. A
+int nmeaChecksum          = 0;
+int nmeaChecksum1         = '0';
+int nmeaChecksum2         = '0';
+int nmea_expected_csum1   = '0';
+int nmea_expected_csum2   = '0';
+const int maxNmeaLength   = 100; // Maximum length for an NMEA message used to detect lost sync
+
+// Definitions for u-blox F9P UBX-format (binary) messages
+
+// Disable NMEA output on the I2C port
+uint8_t disableI2cNmea() {
+  return gnss.setVal8(0x10720002, 0x00, VAL_LAYER_RAM);
 }
 
-// Enable UBX RAWX and SFRBX messages on UART1
-uint8_t enableUbx() {
-  myGPS.newCfgValset8(0x209102a5, 0x01, VAL_LAYER_RAM); // CFG-MSGOUT-UBX_RXM_RAWX_UART1
-  return myGPS.sendCfgValset8(0x20910232, 0x01);        // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
+// Set UART1 to 230400 baud
+uint8_t setUart1Baud() {
+  return gnss.setVal32(0x40520001, 0x00038400, VAL_LAYER_RAM); // CFG-UART1-BAUDRATE - 0x00038400 = 230400 decimal
 }
 
-// Disable UBX RAWX and SFRBX messages on UART1
+// Set UART2 to 230400 baud
+uint8_t setUart2Baud230400() {
+  return gnss.setVal32(0x40530001, 0x00038400, VAL_LAYER_RAM);  // CFG-UART2-BAUDRATE - 0x00038400 = 230400 decimal
+}
+
+// Set UART2 to 115200 baud
+uint8_t setUart2Baud115200() {
+  return gnss.setVal32(0x40530001, 0x0001c200, VAL_LAYER_RAM);  // CFG-UART2-BAUDRATE - 0x0001c200 = 230400 decimal
+}
+
+// Disables all messages logged to the SD card
 uint8_t disableUbx() {
-  myGPS.newCfgValset8(0x209102a5, 0x00, VAL_LAYER_RAM); // CFG-MSGOUT-UBX_RXM_RAWX_UART1
-  return myGPS.sendCfgValset8(0x20910232, 0x00);        // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
+  gnss.newCfgValset8(0x209102a5, 0x00, VAL_LAYER_RAM);  // CFG-MSGOUT-UBX_RXM_RAWX_UART1
+  gnss.addCfgValset8(0x20910232, 0x00);                 // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
+  gnss.addCfgValset8(0x20910179, 0x00);                 // CFG-MSGOUT-UBX_TIM_TM2_UART1
+  gnss.addCfgValset8(0x2091002a, 0x00);                 // CFG-MSGOUT-UBX_NAV_POSLLH_UART1
+  gnss.addCfgValset8(0x20910007, 0x00);                 // CFG-MSGOUT-UBX_NAV_PVT_UART1
+  gnss.addCfgValset8(0x2091001b, 0x00);                 // CFG-MSGOUT-UBX_NAV_STATUS_UART1
+  gnss.addCfgValset8(0x20930031, 0x01);                 // CFG-NMEA-MAINTALKERID - Sets the main talker ID to GP
+  gnss.addCfgValset8(0x10930006, 0x00);                 // CFG-NMEA-HIGHPREC - Disables NMEA high precision mode
+  return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1 - Disables the GGA message
+}
+
+// Enables all messages to be logged to the SD card
+// 0x2091002a (CFG-MSGOUT-UBX_NAV_POSLLH_UART1)
+// 0x20910007 (CFG-MSGOUT-UBX_NAV_PVT_UART1)
+// 0x2091001b (CFG-MSGOUT-UBX_NAV_STATUS_UART1)
+// 0x10930006 (CFG-NMEA-HIGHPREC)
+// 0x209100bb (CFG-MSGOUT-NMEA_ID_GGA_UART1)
+// 0x20930031 (CFG-NMEA-MAINTALKERID) has value 3 (GN)
+uint8_t enableUbx() {
+  gnss.newCfgValset8(0x209102a5, 0x01, VAL_LAYER_RAM);  // CFG-MSGOUT-UBX_RXM_RAWX_UART1
+  gnss.addCfgValset8(0x20910232, 0x01);                 // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
+  gnss.addCfgValset8(0x20910179, 0x01);                 // CFG-MSGOUT-UBX_TIM_TM2_UART1
+  //gnss.addCfgValset8(0x2091002a, 0x01);   // Change the last byte from 0x01 to 0x00 to leave NAV_POSLLH disabled
+  //gnss.addCfgValset8(0x20910007, 0x01);   // Change the last byte from 0x01 to 0x00 to leave NAV_PVT disabled
+  //gnss.addCfgValset8(0x2091001b, 0x01);   // This line enables the NAV_STATUS message
+  //gnss.addCfgValset8(0x20930031, 0x03);   // This line sets the main talker ID to GN
+  //gnss.addCfgValset8(0x10930006, 0x01);   // This sets the NMEA high precision mode
+  return gnss.sendCfgValset8(0x209100bb, 0x00); // This (re)enables the GGA mesage (set 1 temp)
 }
 
 // Enable NMEA messages on UART1
 uint8_t enableNmea() {
-  myGPS.newCfgValset8(0x209100bb, 0x01, VAL_LAYER_RAM); // CFG-MSGOUT-NMEA_ID_GGA_UART1
-  myGPS.addCfgValset8(0x209100ca, 0x01);                // CFG-MSGOUT-NMEA_ID_GLL_UART1
-  myGPS.addCfgValset8(0x209100c0, 0x01);                // CFG-MSGOUT-NMEA_ID_GSA_UART1
-  myGPS.addCfgValset8(0x209100c5, 0x01);                // CFG-MSGOUT-NMEA_ID_GSV_UART1
-  myGPS.addCfgValset8(0x209100b1, 0x01);                // CFG-MSGOUT-NMEA_ID_VTG_UART1
-  myGPS.addCfgValset8(0x209100ac, 0x01);                // CFG-MSGOUT-NMEA_ID_RMC_UART1
-  return myGPS.sendCfgValset8(0x209100b1, 0x07);        // CFG-INFMSG-NMEA_UART1
+  gnss.newCfgValset8(0x209100bb, 0x01, VAL_LAYER_RAM); // CFG-MSGOUT-NMEA_ID_GGA_UART1
+  gnss.addCfgValset8(0x209100ca, 0x01);                // CFG-MSGOUT-NMEA_ID_GLL_UART1
+  gnss.addCfgValset8(0x209100c0, 0x01);                // CFG-MSGOUT-NMEA_ID_GSA_UART1
+  gnss.addCfgValset8(0x209100c5, 0x01);                // CFG-MSGOUT-NMEA_ID_GSV_UART1
+  gnss.addCfgValset8(0x209100b1, 0x01);                // CFG-MSGOUT-NMEA_ID_VTG_UART1
+  gnss.addCfgValset8(0x209100ac, 0x01);                // CFG-MSGOUT-NMEA_ID_RMC_UART1
+  return gnss.sendCfgValset8(0x209100b1, 0x07);        // CFG-INFMSG-NMEA_UART1
 }
 
 // Disable NMEA messages on UART1
 uint8_t disableNmea() {
-  myGPS.newCfgValset8(0x209100bb, 0x00, VAL_LAYER_RAM); // CFG-MSGOUT-NMEA_ID_GGA_UART1
-  myGPS.addCfgValset8(0x209100ca, 0x00);                // CFG-MSGOUT-NMEA_ID_GLL_UART1
-  myGPS.addCfgValset8(0x209100c0, 0x00);                // CFG-MSGOUT-NMEA_ID_GSA_UART1
-  myGPS.addCfgValset8(0x209100c5, 0x00);                // CFG-MSGOUT-NMEA_ID_GSV_UART1
-  myGPS.addCfgValset8(0x209100b1, 0x00);                // CFG-MSGOUT-NMEA_ID_VTG_UART1
-  myGPS.addCfgValset8(0x209100ac, 0x00);                // CFG-MSGOUT-NMEA_ID_RMC_UART1
-  return myGPS.sendCfgValset8(0x209100b1, 0x00);        // CFG-INFMSG-NMEA_UART1
+  gnss.newCfgValset8(0x209100bb, 0x00, VAL_LAYER_RAM); // CFG-MSGOUT-NMEA_ID_GGA_UART1
+  gnss.addCfgValset8(0x209100ca, 0x00);                // CFG-MSGOUT-NMEA_ID_GLL_UART1
+  gnss.addCfgValset8(0x209100c0, 0x00);                // CFG-MSGOUT-NMEA_ID_GSA_UART1
+  gnss.addCfgValset8(0x209100c5, 0x00);                // CFG-MSGOUT-NMEA_ID_GSV_UART1
+  gnss.addCfgValset8(0x209100b1, 0x00);                // CFG-MSGOUT-NMEA_ID_VTG_UART1
+  gnss.addCfgValset8(0x209100ac, 0x00);                // CFG-MSGOUT-NMEA_ID_RMC_UART1
+  return gnss.sendCfgValset8(0x209100b1, 0x00);        // CFG-INFMSG-NMEA_UART1
 }
 
+// Set the Main NMEA Talker ID to "GP"
+uint8_t setTalkerId() {
+  return gnss.setVal8(0x20930031, 0x01, VAL_LAYER_RAM); // CFG-NMEA-MAINTALKERID
+}
 
-//*****************************************************************************
-//
+// Set time between GNSS measurements (CFG-RATE-MEAS)
+uint8_t setRate20Hz() {
+  return gnss.setVal16(0x30210001, 0x0032, VAL_LAYER_RAM);
+}
+uint8_t setRate10Hz() {
+  return gnss.setVal16(0x30210001, 0x0064, VAL_LAYER_RAM);
+}
+uint8_t setRate5Hz() {
+  return gnss.setVal16(0x30210001, 0x00c8, VAL_LAYER_RAM);
+}
+uint8_t setRate4Hz() {
+  return gnss.setVal16(0x30210001, 0x00fa, VAL_LAYER_RAM);
+}
+uint8_t setRate2Hz() {
+  return gnss.setVal16(0x30210001, 0x01f4, VAL_LAYER_RAM);
+}
+uint8_t setRate1Hz() {
+  return gnss.setVal16(0x30210001, 0x03e8, VAL_LAYER_RAM);
+}
+
+// Set the navigation dynamic model
+// UBX-CFG-VALSET message with a key ID of 0x20110021 (CFG-NAVSPG-DYNMODEL)
+uint8_t setNavPortable() {
+  return gnss.setVal8(0x20110021, 0x00, VAL_LAYER_RAM);
+};
+uint8_t setNavStationary() {
+  return gnss.setVal8(0x20110021, 0x02, VAL_LAYER_RAM);
+};
+uint8_t setNavPedestrian() {
+  return gnss.setVal8(0x20110021, 0x03, VAL_LAYER_RAM);
+};
+uint8_t setNAVautomotive() {
+  return gnss.setVal8(0x20110021, 0x04, VAL_LAYER_RAM);
+};
+uint8_t setNAVsea() {
+  return gnss.setVal8(0x20110021, 0x05, VAL_LAYER_RAM);
+};
+uint8_t setNAVair1g() {
+  return gnss.setVal8(0x20110021, 0x06, VAL_LAYER_RAM);
+};
+uint8_t setNAVair2g() {
+  return gnss.setVal8(0x20110021, 0x07, VAL_LAYER_RAM);
+};
+uint8_t setNAVair4g() {
+  return gnss.setVal8(0x20110021, 0x08, VAL_LAYER_RAM);
+};
+uint8_t setNAVwrist() {
+  return gnss.setVal8(0x20110021, 0x09, VAL_LAYER_RAM);
+};
+
+// Set Survey_In mode
+// UBX-CFG-VALSET message with a key IDs and values of:
+// 0x20030001 (CFG-TMODE-MODE) and a value of 1
+// 0x40030011 (CFG-TMODE-SVIN_ACC_LIMIT) and a value of 0x0000c350 (50000 decimal = 5 m)
+// 0x40030010 (CFG-TMODE-SVIN_MIN_DUR) and a value of 0x0000003c (60 decimal = 1 min)
+uint8_t setSurveyIn() {
+  gnss.newCfgValset8(0x20030001, 0x01, VAL_LAYER_RAM);  // CFG-TMODE-MODE
+  gnss.addCfgValset32(0x40030011, 0x0000c350);          // CFG-TMODE-SVIN_ACC_LIMIT
+  return gnss.sendCfgValset32(0x40030010, 0x0000003c);  // CFG-TMODE-SVIN_MIN_DUR
+}
+
+// Disable Survey_In mode
+uint8_t disableSurveyIn() {
+  return gnss.setVal8(0x20030001, 0x00, VAL_LAYER_RAM); // CFG-TMODE-MODE
+}
+
+// Enable RTCM message output on UART2
+// Set the value byte to 0x01 to send an RTCM message at RATE_MEAS; set the value to 0x04 to send an RTCM message at 1/4 RATE_MEAS
+// (i.e. assumes you will be logging RAWX data at 4 Hz. Adjust accordingly)
+uint8_t enableRtcm() {
+  gnss.newCfgValset8(0x209102bf, 0x04, VAL_LAYER_RAM);  // CFG-MSGOUT-RTCM_3X_TYPE1005_UART2
+  gnss.addCfgValset8(0x209102ce, 0x04);                 // CFG-MSGOUT-RTCM_3X_TYPE1077_UART2
+  gnss.addCfgValset8(0x209102d3, 0x04);                 // CFG-MSGOUT-RTCM_3X_TYPE1087_UART2
+  gnss.addCfgValset8(0x209102d8, 0x04);                 // CFG-MSGOUT-RTCM_3X_TYPE1127_UART2
+  gnss.addCfgValset8(0x2091031a, 0x04);                 // CFG-MSGOUT-RTCM_3X_TYPE1097_UART2
+  return gnss.sendCfgValset8(0x20910305, 0x28);         // CFG-MSGOUT-RTCM_3X_TYPE1230_UART2
+}
+
+// Disable RTCM message output on UART2
+uint8_t disableRtcm() {
+  gnss.newCfgValset8(0x209102bf, 0x00, VAL_LAYER_RAM);  // CFG-MSGOUT-RTCM_3X_TYPE1005_UART2
+  gnss.addCfgValset8(0x209102ce, 0x00);                 // CFG-MSGOUT-RTCM_3X_TYPE1077_UART2
+  gnss.addCfgValset8(0x209102d3, 0x00);                 // CFG-MSGOUT-RTCM_3X_TYPE1087_UART2
+  gnss.addCfgValset8(0x209102d8, 0x00);                 // CFG-MSGOUT-RTCM_3X_TYPE1127_UART2
+  gnss.addCfgValset8(0x2091031a, 0x00);                 // CFG-MSGOUT-RTCM_3X_TYPE1097_UART2
+  return gnss.sendCfgValset8(0x20910305, 0x00);         // CFG-MSGOUT-RTCM_3X_TYPE1230_UART2
+}
+
+// Set TimeGrid for TP1 to GPS (instead of UTC) so TIM_TM2 messages are aligned with GPS time
+uint8_t setTimeGrid() {
+  return gnss.setVal8(0x2005000c, 0x01, VAL_LAYER_RAM); // CFG-TP-TIMEGRID_TP1, 0x01 = GPS
+}
+
+// Enable NMEA messages on UART2 for test purposes
+// UBX-CFG-VALSET message with key ID of 0x10760002 (CFG-UART2OUTPROT-NMEA) and value of 1:
+uint8_t setUART2nmea() {
+  return gnss.setVal8(0x10760002, 0x01, VAL_LAYER_RAM);
+}
+
+// 'Disable' timepulse TP1 by setting LEN_LOCK_TP1 to zero
+// (This doesn't actually disable the timepulse, it just sets its length to zero!)
+uint8_t disableTP1() {
+  return gnss.setVal32(0x40050005, 0x00, VAL_LAYER_RAM); // CFG-TP-LEN_LOCK_TP1
+}
+
+// Define SerialBuffer as a large RingBuffer which we will use to store the Serial1 receive data
+// Actual Serial1 receive data will be copied into SerialBuffer by a timer interrupt
+// https://gist.github.com/jdneo/43be30d85080b175cb5aed3500d3f989
+// That way, we do not need to increase the size of the Serial1 receive buffer (by editing RingBuffer.h)
+// You can use DEBUG_SERIAL_BUFFER to determine how big the buffer should be. Increase it if you see bufAvail get close to or reach the buffer size.
+RingBufferN<16384> SerialBuffer; // Define SerialBuffer as a RingBuffer of size 16k bytes
+
+// TimerCounter3 functions to copy Serial1 receive data into SerialBuffer
+// https://gist.github.com/jdneo/43be30d85080b175cb5aed3500d3f989
+#define CPU_HZ 48000000
+#define TIMER_PRESCALER_DIV 16
+
+// Set TC3 Interval (sec)
+void setTimerInterval(float intervalS) {
+  int compareValue = intervalS * CPU_HZ / TIMER_PRESCALER_DIV;
+  if (compareValue > 65535) compareValue = 65535;
+  TcCount16* TC = (TcCount16*) TC3;
+  // Make sure the count is in a proportional position to where it was
+  // to prevent any jitter or disconnect when changing the compare value.
+  TC->COUNT.reg = map(TC->COUNT.reg, 0, TC->CC[0].reg, 0, compareValue);
+  TC->CC[0].reg = compareValue;
+  while (TC->STATUS.bit.SYNCBUSY == 1);
+}
+
+// Start TC3 with a specified interval
+void startTimerInterval(float intervalS) {
+  REG_GCLK_CLKCTRL = (uint16_t) (GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_ID_TCC2_TC3) ;
+  while ( GCLK->STATUS.bit.SYNCBUSY == 1 ); // wait for sync
+
+  TcCount16* TC = (TcCount16*) TC3;
+
+  TC->CTRLA.reg &= ~TC_CTRLA_ENABLE;
+  while (TC->STATUS.bit.SYNCBUSY == 1); // wait for sync
+
+  // Use the 16-bit timer
+  TC->CTRLA.reg |= TC_CTRLA_MODE_COUNT16;
+  while (TC->STATUS.bit.SYNCBUSY == 1); // wait for sync
+
+  // Use match mode so that the timer counter resets when the count matches the compare register
+  TC->CTRLA.reg |= TC_CTRLA_WAVEGEN_MFRQ;
+  while (TC->STATUS.bit.SYNCBUSY == 1); // wait for sync
+
+  // Set prescaler to 16
+  TC->CTRLA.reg |= TC_CTRLA_PRESCALER_DIV16;
+  while (TC->STATUS.bit.SYNCBUSY == 1); // wait for sync
+
+  setTimerInterval(intervalS);
+
+  // Enable the compare interrupt
+  TC->INTENSET.reg = 0;
+  TC->INTENSET.bit.MC0 = 1;
+
+  NVIC_SetPriority(TC3_IRQn, 3); // Set the TC3 interrupt priority to 3 (lowest)
+  NVIC_EnableIRQ(TC3_IRQn);
+
+  TC->CTRLA.reg |= TC_CTRLA_ENABLE;
+  while (TC->STATUS.bit.SYNCBUSY == 1); // wait for sync
+}
+
+// TC3 Interrupt Handler
+void TC3_Handler() {
+  TcCount16* TC = (TcCount16*) TC3;
+  // If this interrupt is due to the compare register matching the timer count
+  // copy any available Serial1 data into SerialBuffer
+  if (TC->INTFLAG.bit.MC0 == 1) {
+    TC->INTFLAG.bit.MC0 = 1;
+    int available1 = Serial1.available(); // Check if there is any data waiting in the Serial1 RX buffer
+    while (available1 > 0) {
+      SerialBuffer.store_char(Serial1.read()); // If there is, copy it into our RingBuffer
+      available1--;
+    }
+  }
+}
+
 // Setup
-//
-//*****************************************************************************
 void setup() {
 
   // Pin configuration
-  pinMode(RTC_INT_PIN, INPUT_PULLUP); // Configure interrupt on SQW/INT pin
-  pinMode(SW_PIN, INPUT_PULLUP);      // Configure input for stop switch
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(MODE_PIN, INPUT_PULLUP);    // Input for the Base/Rover mode select switch
+  pinMode(SW_PIN, INPUT_PULLUP);      // Input for the stop switch
+  pinMode(SURVEY_PIN, INPUT_PULLUP);  // Input for the SURVEY_IN switch
+
   digitalWrite(LED_BUILTIN, LOW);
   digitalWrite(LED_PIN, LOW);
+  digitalWrite(MODE_PIN, LOW); // Manually set to base mode
 
-  // Initialize the RTC
-  myRTC.begin();                                // Initialize the I2C bus
-  myRTC.setAlarm(ALM1_MATCH_DATE, 0, 0, 0, 1);  // Initialize alarms to known values
-  myRTC.setAlarm(ALM2_MATCH_DATE, 0, 0, 0, 1);
-  myRTC.alarm(ALARM_1);                         // Clear alarm flags
-  myRTC.alarm(ALARM_2);
-  myRTC.alarmInterrupt(ALARM_1, false);         // Clear alarm interrupt flags
-  myRTC.alarmInterrupt(ALARM_2, false);
-  myRTC.squareWave(SQWAVE_NONE);                // Configure SQW/INT pin for interrupt operation (disable square wave output)
-
-  // Attach a wakeup interrupt that triggers on the falling edge
-  LowPower.attachInterruptWakeup(RTC_INT_PIN, alarmIsr, FALLING);
+  // Blink LEDs on reset
+  for (int i = 0; i <= 4; i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(200);
+    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+  }
 
   // Start Serial at 115200 baud
   Serial.begin(115200);
   //while (!Serial);    // Wait for user to open Serial Monitor
-  delay(5000);       // Allow 10 seconds for user to open Serial Monitor
+  delay(5000);       // Delay to allow user to open Serial Monitor
 
-  // Print current date and time
-  printDateTime(myRTC.get());
-
-  Serial.println();
   Serial.println("u-blox ZED-F9P Raw Datalogger");
-  Serial.println("-----------------------------");
 
-  // I2C Configuration
+  // Initialize I2C
   Wire.begin();
-  Wire.setClock(400000);  // Increase clock frequency for I2C communications to 400 kHz
+  Wire.setClock(400000); // Increase clock frequency for I2C communications to 400 kHz
+
+  // Initialize the RTC
+  rtc.begin();
 
   // Initialize the SD card
-  Serial.println("Initializing SD card...");
   if (sd.begin(chipSelect, SD_SCK_MHZ(4))) {
     Serial.println("SD card initialized.");
   }
   else {
-    Serial.println("Unable to initialize SD card. Halting.");
+    Serial.println("Warning: Unable to initialize SD card. Halting!");
     digitalWrite(LED_BUILTIN, HIGH);
     digitalWrite(LED_PIN, HIGH);
     while (1); // Halt the program
   }
 
-  // u-blox ZED-F9P Configuration
-  Serial.println("Initializing u-blox ZED-F9P...");
-  //Connect to the u-blox ZED-F9P using the Wire (I2C) interface
-  if (myGPS.begin() == true) {
-    Serial.println("u-blox ZED-F9P detected");
+  // Initialize the u-blox ZED-F9P
+  if (gnss.begin() == true) {
+    Serial.println("u-blox ZED-F9P initialized."); // Connect to the u-blox ZED-F9P using the Wire (I2C) interface
 #if DEBUG_I2C
-    myGPS.enableDebugging(); // Enable I2C debug messages over Serial
+    gnss.enableDebugging(); // Enable I2C debug output to Serial Monitor
 #endif
   }
   else {
-    Serial.println("u-blox ZED-F9P not detected at default I2C address. Please check wiring. Halting.");
+    Serial.println("Warning: u-blox ZED-F9P not detected at default I2C address. Please check wiring. Halting!");
     digitalWrite(LED_BUILTIN, HIGH);
     digitalWrite(LED_PIN, HIGH);
     while (1); // Halt the program
   }
 
-  // Receiver configuration messages:
-  // Message Acknowledged:      UBX-ACK-ACK (0x05 0x01)
-  // Message Not-Acknowledged:  UBX-ACK-NAK (0x05 0x00)
-  // Payload:                   UBX-CFG-VALSET (0x06 0x8A)
-  bool setValueSuccess = true;
-  setValueSuccess &= myGPS.setVal8(0x10720002, 0);        // Disable NMEA as an output protocol on I2C      (CFG-I2COUTPROT-NMEA)
-  setValueSuccess &= myGPS.setVal32(0x40520001, 230400);  // Set UART1 baud rate to 230400                  (CFG-UART1-BAUDRATE)
-  setValueSuccess &= myGPS.setVal8(0x20110021, 2);        // Set the dynamic platform model to stationary   (CFG-NAVSPG-DYNMODEL)
-  setValueSuccess &= myGPS.setVal16(0x30210001, 1000);    // Set time between GNSS measurements to 1000 ms  (CFG-RATE-MEAS)
-  setValueSuccess &= configureGnss();                     // Configure GNSS signals
-  setValueSuccess &= disableUbx();                        // Disable RAWX messages on UART1
-  setValueSuccess &= disableNmea();                       // Disable NMEA messages on UART1
+  // These sendCommands will timeout as the commandAck checking in processUBXpacket expects the packet to be in packetCfg, not our custom packet!
+  // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:5 ID:1 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
+  boolean setValueSuccess = true;
+  setValueSuccess &= disableI2cNmea();       //Disable NMEA messages on the I2C port leaving it clear for UBX messages
+  setValueSuccess &= setUart1Baud();         // Change the UART1 baud rate to 230400
+  setValueSuccess &= disableUbx();           // Disable RAWX messages on UART1. Also disables the NMEA high precision mode
+  setValueSuccess &= disableNmea();          // Disable NMEA messages on UART1
+  setValueSuccess &= setTalkerId();          // Set NMEA TALKERID to GP
+  setValueSuccess &= setRate1Hz();            // Set Navigation/Measurement Rate to 1Hz
+  setValueSuccess &= setUart2Baud115200();  // Set UART2 Baud rate
+  setValueSuccess &= disableSurveyIn();      // Disable Survey_In mode
+  setValueSuccess &= disableRtcm();           // Disable RTCM output on UART2
+  setValueSuccess &= setTimeGrid();          // Set the TP1 TimeGrid to GPS so TIM_TM2 messages are aligned with GPS time
 
   if (setValueSuccess == true) {
-    Serial.println("u-blox ZED-F9P initialized.");
+    Serial.println("u-blox ZED-F9P configured.");
   }
   else {
-    Serial.println("Unable to initialize u-blox ZED-F9P. Halting.");
+    Serial.println("Warning: Unable to configure u-blox ZED-F9P. Halting!");
     digitalWrite(LED_BUILTIN, HIGH);
     digitalWrite(LED_PIN, HIGH);
     while (1); // Halt the program
   }
 
-  // Start Serial1 at 230400 baud.
+  // Check the MODE_PIN and set the navigation dynamic model
+  if (digitalRead(MODE_PIN) == LOW) {
+    Serial.println("BASE mode selected");
+    setNavStationary(); // Set Static Navigation Mode (use this for the Base Logger)
+  }
+  else {
+    modeFlag = false; // Clear modeFlag flag
+    Serial.println("ROVER mode selected");
+    // Select one mode for the mobile Rover Logger
+    setNavPortable(); // Set Portable Navigation Mode
+    //setNavPedestrian(); // Set Pedestrian Navigation Mode
+    //setNAVautomotive(); // Set Automotive Navigation Mode
+    //setNAVsea(); // Set Sea Navigation Mode
+    //setNAVair1g(); // Set Airborne <1G Navigation Mode
+    //setNAVair2g(); // Set Airborne <2G Navigation Mode
+    //setNAVair4g(); // Set Airborne <4G Navigation Mode
+    //setNAVwrist(); // Set Wrist Navigation Mode
+  }
+
+#if NO_LED
+  disableTP1(); // Disable the timepulse to stop the LED from flashing
+#endif
+
+  // Start Serial1 at 230400 baud
   Serial1.begin(230400);
 
-  // Wait for GNSS fix.
-  Serial.println("Waiting for GNSS fix...");
+  // Print RTC's current date and time
+  Serial.print("Current RTC date and time: "); printDateTime();
+
+  // Wait for GNSS fix
+  Serial.println("Awaiting GNSS fix...");
 }
 
-//*****************************************************************************
-//
 // Loop
-//
-//*****************************************************************************
 void loop() {
 
   switch (loopStep) {
-
-    case START: {
+    case INIT: {
 
 #if DEBUG
-        char gnssDateTime[20]; // GNSS date time buffer
+        char gnssDateTime[24]; // GNSS date and time buffer
         snprintf(gnssDateTime, sizeof(gnssDateTime), "%04u-%02d-%02d %02d:%02d:%02d",
-                 myGPS.getYear(), myGPS.getMonth(), myGPS.getDay(),
-                 myGPS.getHour(), myGPS.getMinute(), myGPS.getSecond());
+                 gnss.getYear(), gnss.getMonth(), gnss.getDay(),
+                 gnss.getHour(), gnss.getMinute(), gnss.getSecond());
 
-        int32_t latitude = myGPS.getLatitude();
-        int32_t longitude = myGPS.getLongitude();
-        float pdop = myGPS.getPDOP() / 100.0;
-        uint8_t fix = myGPS.getFixType();
-        uint8_t satellites = myGPS.getSIV();
+        int32_t latitude = gnss.getLatitude();
+        int32_t longitude = gnss.getLongitude();
+        uint16_t pdop = gnss.getPDOP();
+        uint8_t fix = gnss.getFixType();
+        uint8_t satellites = gnss.getSIV();
 
-        Serial.print("RTC: "); printDateTime(myRTC.get());
-        Serial.print(" GNSS: "); Serial.print(gnssDateTime);
-        Serial.print(" LAT: "); Serial.print(latitude);
-        Serial.print(" LON: "); Serial.print(longitude);
-        Serial.print(" SAT: "); Serial.print(satellites);
-        Serial.print(" FIX: "); Serial.print(fix);
-        Serial.print(" PDOP: "); Serial.println(pdop, 2);
+        Serial.print(gnssDateTime);
+        Serial.print(" Latitude: "); Serial.print(latitude);
+        Serial.print(" Longitude: "); Serial.print(longitude);
+        Serial.print(" Satellites: "); Serial.print(satellites);
+        Serial.print(" Fix: "); Serial.print(fix);
+        Serial.print(" PDOP: "); Serial.println(pdop);
 #endif
 
-        // Do we have a GNSS fix?
-        if (myGPS.getFixType() > 0) {
+        // Read battery voltage
+        voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
+#if DEBUG
+        //Serial.print("Battery(V): ");
+        //Serial.println(voltage, 2);
+#endif
+
+        // Turn green LED on to indicate GNSS fix
+        if (gnss.getFixType() > 0) {
+          digitalWrite(LED_PIN, HIGH);
+
           // Increment valFix and cap at maxValFix
-          // Do not decrement valFix as logging will continue even if fix is lost
+          // don't do anything fancy in terms of decrementing valFix as we want to keep logging even if the fix is lost
           valFix += 1;
-          if (valFix > maxValFix) {
-            valFix = maxValFix;
-          }
+          if (valFix > maxValFix) valFix = maxValFix;
+        }
+        else {
+          digitalWrite(LED_PIN, LOW); // Turn LED off
         }
 
-        // Have enough valid GNSS fixes been collected?
+        // Wait until enough valid GNSS fixes have been collected
         if (valFix == maxValFix) {
-          valFix = 0; // Reset GNSS fix counter
 
-          // Set the RTC using GNSS date and time
-          tm.Second = myGPS.getSecond();
-          tm.Minute = myGPS.getMinute();
-          tm.Hour   = myGPS.getHour();
-          tm.Day    = myGPS.getDay();
-          tm.Month  = myGPS.getMonth();
-          tm.Year   = (myGPS.getYear() - 1970); // tmElements_t.Year is the offset from 1970
-          t = makeTime(tm);                     // Change tm structure into time_t (seconds since epoch)
-          myRTC.set(t);                         // Set RTC time
+          // Set the RTC's date and time
+          alarmFlag = false; // Clear alarm flag
+          rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond()); // Set the time
+          rtc.setDate(gnss.getDay(), gnss.getMonth(), (uint8_t)(gnss.getYear() - 2000)); // Set the date
+          rtc.setAlarmSeconds(0); // Set RTC Alarm Seconds to zero
 
-          Serial.print("RTC set: ");
-          printDateTime(t);
-          Serial.println();
+          // Set the RTC's alarm
+          uint8_t nextAlarmMin = ((gnss.getMinute() + alarmInterval) / alarmInterval) * alarmInterval; // Calculate next alarm minutes
+          nextAlarmMin = nextAlarmMin % 60;   // Correct hour rollover
+          rtc.setAlarmMinutes(nextAlarmMin);  // Set RTC Alarm Minutes
+          rtc.enableAlarm(rtc.MATCH_MMSS);    // Alarm Match on minutes and seconds
+          rtc.attachInterrupt(alarmMatch);    // Attach alarm interrupt
 
-          // Set alarm 1
-          myRTC.read(tm);                                   // Read date and time
-          //myRTC.setAlarm(ALM1_MATCH_SECONDS, 0, 0, 0, 0);   // Set alarm to minute rollover
-          //myRTC.setAlarm(ALM1_MATCH_MINUTES, 0, (tm.Minute + alarmInterval) % 60, 0, 0);  // Calculate next alarm
-          myRTC.setAlarm(ALM1_MATCH_MINUTES, 0, 0, 0, 0);   // Set alarm to hour rollover
-          //myRTC.setAlarm(ALM1_MATCH_HOURS, 0, 0, 0, 0);     // Set alarm to day rollover
-          myRTC.alarm(ALARM_1);                             // Ensure alarm 1 interrupt flag is cleared
-          myRTC.alarmInterrupt(ALARM_1, true);              // Enable interrupt output for alarm 1
+          // check if voltage is > lowVoltage(V), if not then don't try to log any data
+          if (voltage < lowVoltage) {
+            Serial.println("Low Battery!");
+            break;
+          }
+
+          // Set the RAWX measurement rate
+          //setRate20Hz(); // Set Navigation/Measurement Rate to 20 Hz
+          //setRate10Hz(); // Set Navigation/Measurement Rate to 10 Hz
+          //setRate5Hz(); // Set Navigation/Measurement Rate to 5 Hz
+          //setRate4Hz(); // Set Navigation/Measurement Rate to 4 Hz
+          //setRate2Hz(); // Set Navigation/Measurement Rate to 2 Hz
+          setRate1Hz(); // Set Navigation/Measurement Rate to 1 Hz
+
+          // If we are in BASE mode, check the SURVEY_IN pin
+          if (modeFlag == true) {
+            if (digitalRead(SURVEY_PIN) == LOW) {
+              // We are in BASE mode and the SURVEY_IN pin is low so send the extra UBX messages:
+              Serial.println("SURVEY_IN mode selected");
+              surveyFlag = true;  // Set the surveyFlag flag true
+              enableRtcm();       // Enable RTCM messages on UART2
+              delay(1100);
+              setSurveyIn();      // Enable SURVEY_IN mode
+              delay(1100);
+            }
+          }
 
           // Flush RX buffer to clear any old data
           while (Serial1.available()) {
             Serial1.read();
           }
 
-          // Once Serial1 is idle with an empy buffer, start TC3 interrupts to copy all new data into SerialBuffer
-          // Set timer interval to: 10 * 10 / 230400 = 0.000434 seconds (10 bytes * 10 bits (1 start, 8 data, 1 stop) at 230400 baud)
+          // Now that Serial1 should be idle and the buffer empty, start TC3 interrupts to copy all new data into SerialBuffer
+          // Set the timer interval to 10 * 10 / 230400 = 0.000434 secs (10 bytes * 10 bits (1 start, 8 data, 1 stop) at 230400 baud)
           startTimerInterval(0.000434);
 
-          // Read battery voltage
-          voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
-          Serial.print("voltage: "); Serial.println(voltage, 2);
-
-          // Prevent logging if voltage < lowBattery
-          if (voltage < lowBattery) {
-            Serial.println("Warning: Low battery!");
-            //break;
-          }
-
+          // Start UBX data
           loopStep = START_UBX;
-        } // End if (valFix == maxValFix)
-      } // End case START:
+        }
+      }
       break;
 
+    // Start RAWX messages
     case START_UBX: {
-#if DEBUG
-        Serial.println("case START_UBX:");
-#endif
-        //enableNmea();
-        enableUbx();          // Enable UBX RAWX and SFRBX messages
-        bufferPointer = 0;    // Initialize bufferPointer
 
-        loopStep = OPEN_FILE; // Open log file
-      } // End case START_UBX:
+        Serial.println("Case: START_UBX");
+
+        enableUbx(); // Start the UBX and NMEA messages
+
+        bufferPointer = 0; // Initialise bufferPointer
+
+        loopStep = OPEN_FILE; // Start logging UBX data
+      }
       break;
 
+    // Open the log file
     case OPEN_FILE: {
 
-#if DEBUG
         Serial.println("Case: OPEN_FILE");
-#endif
-        // Read current date and time
-        myRTC.read(tm);
 
         // Create a new folder
-        snprintf(dirName, sizeof(dirName), "%04u%02d%02d", (tm.Year + 1970), tm.Month, tm.Day);
+        snprintf(dirName, sizeof(dirName), "%04u%02d%02d", (rtc.getYear() + 2000), rtc.getMonth(), rtc.getDay());
         if (sd.mkdir(dirName)) {
           Serial.print("Created folder: ");
           Serial.println(dirName);
@@ -408,7 +645,7 @@ void loop() {
 
         // Create log file
         snprintf(fileName, sizeof(fileName), "%04u%02d%02d/%02d%02d%02d.ubx",
-                 (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second);
+                 (rtc.getYear() + 2000), rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
         if (file.open(fileName, O_CREAT | O_WRITE | O_EXCL)) {
           Serial.print("Logging to: ");
           Serial.println(fileName);
@@ -419,7 +656,7 @@ void loop() {
         }
 
         // Set the log file creation time
-        if (!file.timestamp(T_CREATE, (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second)) {
+        if (!file.timestamp(T_CREATE, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
           Serial.println("Warning: Unable to set file create timestamp!");
         }
 
@@ -427,22 +664,21 @@ void loop() {
         parseStep = PARSE_UBX_SYNC_CHAR_1;  // Set parseStep to expect B5 or $
         ubxLength = 0;                      // Set ubxLength to zero
 
-        loopStep = WRITE_FILE; // Start logging data
+        loopStep = WRITE_FILE;
 
       } // End case OPEN_FILE
       break;
 
+    // Stuff bytes into serBuffer and write when we have reached sdPacket
     case WRITE_FILE: {
 
-        // Move bytes into serBuffer and write to SD card once sdPacket threshold is reached
-        int bufferAvailable = SerialBuffer.available();
-
-        if (bufferAvailable > 0) {
+        int bufAvail = SerialBuffer.available();
+        if (bufAvail > 0) {
 #if DEBUG_SERIAL_BUFFER
-          if (bufferAvailable > maxBufferAvailable) {
-            maxBufferAvailable = bufferAvailable;
-            Serial.print("Max bufferAvailable: ");
-            Serial.println(maxBufferAvailable);
+          if (bufAvail > maxSerialBufferAvailable) {
+            maxSerialBufferAvailable = bufAvail;
+            Serial.print("Max bufAvail: ");
+            Serial.println(maxSerialBufferAvailable);
           }
 #endif
           // Read bytes on UART1
@@ -452,35 +688,28 @@ void loop() {
           serBuffer[bufferPointer] = c;
 
 #if DEBUG_UBX
-          // Echo UBX hex data to Serial Monitor
+          // Output UBX hex data to Serial Monitor
+          char dataString[2] = {0};
           sprintf(dataString, "%02X ", c);
           Serial.print(dataString);
 #endif
-
-#if DEBUG_NMEA
-          // Echo NMEA data to Serial Monitor
-          Serial.print(char(c));
-#endif
-
-          bufferPointer++; // Increment counter
-          // If serBuffer equals size of sdPacket (512 bytes), write data to SD card
+          bufferPointer++;
           if (bufferPointer == sdPacket) {
-            digitalWrite(LED_PIN, HIGH);
             bufferPointer = 0;
+            digitalWrite(LED_BUILTIN, HIGH); // Blink the LED to indicate an SD write
+
             numBytes = file.write(&serBuffer, sdPacket);
             file.sync(); // Sync the file system
             bytesWritten += sdPacket;
 
 #if DEBUG
             if (numBytes != sdPacket) {
-              Serial.print("Warning: SD write error! Write size was: ");
-              Serial.print(sdPacket);
-              Serial.print(", but ");
-              Serial.print(numBytes);
-              Serial.println(" were written.");
+              Serial.print("Warning! SD write error. Only ");
+              Serial.print(sdPacket); Serial.print("/");
+              Serial.print(numBytes); Serial.println(" bytes were written.");
             }
 #endif
-            digitalWrite(LED_PIN, LOW);
+            digitalWrite(LED_BUILTIN, LOW);
           }
 
           // UBX Frame Structure:
@@ -506,128 +735,178 @@ void loop() {
           // Only allow a new file to be opened when a complete packet has been processed and
           // parseStep has returned to "PARSE_UBX_SYNC_CHAR_1" or when a data error is detected (SYNC_LOST)
           switch (parseStep) {
-
-            case PARSE_UBX_SYNC_CHAR_1: {
-                // Check for UBX Sync Char 1 (0xB5)
-                if (c == ubxSyncChar1) {
-                  parseStep = PARSE_UBX_SYNC_CHAR_2; // Look for Sync Char 2 (0x62)
+            case (PARSE_UBX_SYNC_CHAR_1): {
+                if (c == 0xB5) { // Have we found Sync Char 1 (0xB5) if we were expecting one?
+                  parseStep = PARSE_UBX_SYNC_CHAR_2; // Now look for Sync Char 2 (0x62)
                 }
-                // Check for NMEA Start Character '$'
-                else if (c == '$') {
-                  parseStep = PARSE_NMEA_START_CHAR; // Continue until an asterix is received
-                  ubxLength = 0;      // Reset ubxLength then use it to track which character has arrived
-                  nmeaChecksum = 0;   // Reset nmeaChecksum and update it as each character arrives
-                  nmeaAddress1 = '0'; // Reset first five NMEA chars to invalid values
+                else if (c == '$') { // Have we found an NMEA '$' if we were expecting one?
+                  parseStep = PARSE_NMEA_START_CHAR; // Now keep going until we receive an asterix
+                  ubxLength = 0; // Reset ubxLength then use it to track which character has arrived
+                  nmeaChecksum = 0; // Reset the nmeaChecksum. Update it as each character arrives
+                  nmeaAddress1 = '0'; // Reset the first five NMEA chars to something invalid
                   nmeaAddress2 = '0';
                   nmeaAddress3 = '0';
                   nmeaAddress4 = '0';
                   nmeaAddress5 = '0';
                 }
                 else {
-                  Serial.println("Warning: Expected UBX Sync Char 1 (0xB5) or NMEA Start Character '$' but did not receive one!");
+                  Serial.println("Warning! Was expecting Sync Char 0xB5 or an NMEA $ but did not receive one!");
                   parseStep = SYNC_LOST;
                 }
-              } // End case PARSE_UBX_SYNC_CHAR_1:
+              }
               break;
-
-            case PARSE_UBX_SYNC_CHAR_2: {
-                // Check for UBX Sync Char 2 (0x62)
-                if (c == ubxSyncChar2) {
+            case (PARSE_UBX_SYNC_CHAR_2): {
+                if (c == 0x62) { // Have we found Sync Char 2 (0x62) when we were expecting one?
                   ubxExpectedChecksumA = 0; // Reset the expected checksum
                   ubxExpectedChecksumB = 0;
-                  parseStep = PARSE_UBX_CLASS; // Look for Class byte
+                  parseStep = PARSE_UBX_CLASS; // Now look for Class byte
                 }
                 else {
-                  Serial.println("Warning: Expected Sync Char 0x62 but did not receive one!");
+                  Serial.println("Warning! Was expecting Sync Char 0x62 but did not receive one!");
                   parseStep = SYNC_LOST;
                 }
-              } // End case PARSE_UBX_SYNC_CHAR_2:
+              }
               break;
-
-            // Class and ID information
-            // RXM_RAWX:    Class 0x02  ID 0x15
-            // RXM_SFRBF:   Class 0x02  ID 0x13
-            case PARSE_UBX_CLASS: {
+            // RXM_RAWX is class 0x02 ID 0x15
+            // RXM_SFRBF is class 0x02 ID 0x13
+            // TIM_TM2 is class 0x0d ID 0x03
+            // NAV_POSLLH is class 0x01 ID 0x02
+            // NAV_PVT is class 0x01 ID 0x07
+            // NAV-STATUS is class 0x01 ID 0x03
+            case (PARSE_UBX_CLASS): {
                 ubxClass = c;
-                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update expected checksum
+                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_ID; // Look for ID byte
-
+                parseStep = PARSE_UBX_ID; // Now look for ID byte
+#if DEBUG
                 // Class syntax checking
-                if (ubxClass != 0x02) {
-                  Serial.println("Warning: Expected Class 0x02 but did not receive one!");
+                if ((ubxClass != 0x02) and (ubxClass != 0x0d) and (ubxClass != 0x01)) {
+                  Serial.println("Warning! Was expecting Class of 0x02 or 0x0d or 0x01 but did not receive one!");
                   parseStep = SYNC_LOST;
                 }
-              } // End case PARSE_UBX_CLASS:
+#endif
+              }
               break;
-
-            case PARSE_UBX_ID: {
+            case (PARSE_UBX_ID): {
                 ubxId = c;
-                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update expected checksum
+                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_LENGTH_LSB; // Look for UBX length LSB
-
-                // UBX Class and ID syntax checking
-                if ((ubxClass == 0x02) && ((ubxId != 0x15) && (ubxId != 0x13))) {
-                  Serial.println("Warning: Expected ID of 0x15 or 0x13 but did not receive one!");
+                parseStep = PARSE_UBX_LENGTH_LSB; // Now look for length LSB
+#if DEBUG
+                // ID syntax checking
+                if ((ubxClass == 0x02) and ((ubxId != 0x15) and (ubxId != 0x13))) {
+                  Serial.println("Warning! Was expecting ID of 0x15 or 0x13 but did not receive one!");
                   parseStep = SYNC_LOST;
                 }
-              } // End case PARSE_UBX_ID:
+                else if ((ubxClass == 0x0d) and (ubxId != 0x03)) {
+                  Serial.println("Warning! Was expecting ID of 0x03 but did not receive one!");
+                  parseStep = SYNC_LOST;
+                }
+                else if ((ubxClass == 0x01) and ((ubxId != 0x02) and (ubxId != 0x07) and (ubxId != 0x03))) {
+                  Serial.println("Warning! Was expecting ID of 0x02 or 0x07 or 0x03 but did not receive one!");
+                  parseStep = SYNC_LOST;
+                }
+#endif
+              }
               break;
-
-            case PARSE_UBX_LENGTH_LSB: {
+            case (PARSE_UBX_LENGTH_LSB): {
                 ubxLength = c; // Store the length LSB
-                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update expected checksum
+                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_LENGTH_MSB; // Look for length MSB
-              } // End case PARSE_UBX_LENGTH_LSB:
+                parseStep = PARSE_UBX_LENGTH_MSB; // Now look for length MSB
+              }
               break;
-
-            case PARSE_UBX_LENGTH_MSB: {
-                ubxLength = ubxLength + (c * 256); // Add length MSB
-                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update expected checksum
+            case (PARSE_UBX_LENGTH_MSB): {
+                ubxLength = ubxLength + (c * 256); // Add the length MSB
+                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_PAYLOAD; // Look for payload bytes (length: ubxLength)
-              } // End case PARSE_UBX_LENGTH_MSB:
+                parseStep = PARSE_UBX_PAYLOAD; // Now look for payload bytes (length: ubxLength)
+              }
               break;
+            case (PARSE_UBX_PAYLOAD): {
+                // If this is a NAV_PVT message, check the flags byte (byte offset 21) and report the carrSoln
+                if ((ubxClass == 0x01) and (ubxId == 0x07)) { // Is this a NAV_PVT message (class 0x01 ID 0x07)?
+                  if (ubxLength == 71) { // Is this byte offset 21? (ubxLength will be 92 for byte offset 0, so will be 71 for byte offset 21)
+#if DEBUG
+                    Serial.print("NAV_PVT carrSoln: ");
+                    if ((c & 0xc0) == 0x00) {
+                      Serial.println("none");
+                    }
+                    else if ((c & 0xc0) == 0x40) {
+                      Serial.println("floating");
+                    }
+                    else if ((c & 0xc0) == 0x80) {
+                      Serial.println("fixed");
+                    }
+#endif
+                    if ((c & 0xc0) == 0x80) { // Have we got a fixed carrier solution?
+                    }
+                  }
+                }
+                // If this is a NAV_STATUS message, check the gpsFix byte (byte offset 4) and flash the green LED if the fix is TIME
+                if ((ubxClass == 0x01) and (ubxId == 0x03)) { // Is this a NAV_STATUS message (class 0x01 ID 0x03)?
+                  if (ubxLength == 12) { // Is this byte offset 4? (ubxLength will be 16 for byte offset 0, so will be 12 for byte offset 4)
+#if DEBUG
+                    Serial.print("NAV_STATUS gpsFix: ");
+                    if (c == 0x00) {
+                      Serial.println("No fix");
+                    }
+                    else if (c == 0x01) {
+                      Serial.println("Dead reckoning");
+                    }
+                    else if (c == 0x02) {
+                      Serial.println("2D-fix");
+                    }
+                    else if (c == 0x03) {
+                      Serial.println("3D-fix");
+                    }
+                    else if (c == 0x04) {
+                      Serial.println("GPS + dead reckoning");
+                    }
+                    else if (c == 0x05) {
+                      Serial.println("Time");
+                    }
+                    else {
+                      Serial.println("Reserved");
+                    }
+#endif
+                    if (c == 0x05) { // Have we got a TIME fix?
 
-            case PARSE_UBX_PAYLOAD: {
-                ubxLength = ubxLength - 1; // Decrement length by 1
-                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update expected checksum
+                    }
+                  }
+                }
+                ubxLength = ubxLength - 1; // Decrement length by one
+                ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
                 if (ubxLength == 0) {
                   ubxExpectedChecksumA = ubxExpectedChecksumA & 0xff; // Limit checksums to 8-bits
                   ubxExpectedChecksumB = ubxExpectedChecksumB & 0xff;
                   parseStep = PARSE_UBX_CHECKSUM_A; // If we have received length payload bytes, look for checksum bytes
                 }
-              } // End case PARSE_UBX_PAYLOAD:
+              }
               break;
-
-            case PARSE_UBX_CHECKSUM_A: {
+            case (PARSE_UBX_CHECKSUM_A): {
                 ubxChecksumA = c;
                 parseStep = PARSE_UBX_CHECKSUM_B;
-              } // End case PARSE_UBX_SYNC_CHAR_1:
+              }
               break;
-
-            case PARSE_UBX_CHECKSUM_B: {
-#if DEBUG_UBX
-                Serial.println(); // Serial Monitor line break between UBX messages
-#endif
+            case (PARSE_UBX_CHECKSUM_B): {
                 ubxChecksumB = c;
-                parseStep = PARSE_UBX_SYNC_CHAR_1; // All bytes received. Look for new Sync Char 1 unless there is a checksum error
-                if ((ubxExpectedChecksumA != ubxChecksumA) || (ubxExpectedChecksumB != ubxChecksumB)) {
-                  Serial.println("Warning: UBX checksum error!");
+#if DEBUG_UBX
+                Serial.println(); // Insert line break between UBX frames in Serial Monitor
+#endif
+                parseStep = PARSE_UBX_SYNC_CHAR_1; // All bytes received so go back to looking for a new Sync Char 1 unless there is a checksum error
+                if ((ubxExpectedChecksumA != ubxChecksumA) or (ubxExpectedChecksumB != ubxChecksumB)) {
+                  Serial.println("Warning! UBX checksum error!");
                   parseStep = SYNC_LOST;
                 }
-              } // End case PARSE_UBX_CHECKSUM_B:
+              }
               break;
-
-            // Parse NMEA messages
-            case PARSE_NMEA_START_CHAR: {
-                ubxLength++; // Increase message length count
-                // If length is greater than nmeaMaxLength, likely SYNC_LOST
-                if (ubxLength > nmeaMaxLength) {
-                  Serial.println("Warning: Excessive NMEA message length!");
+            // NMEA messages
+            case (PARSE_NMEA_START_CHAR): {
+                ubxLength++; // Increase the message length count
+                if (ubxLength > maxNmeaLength) { // If the length is greater than maxNmeaLength, something bad must have happened (SYNC_LOST)
+                  Serial.println("Warning! Excessive NMEA message length!");
                   parseStep = SYNC_LOST;
                   break;
                 }
@@ -648,7 +927,6 @@ void loop() {
                   }
                   else { // ubxLength == 5
                     nmeaAddress5 = c;
-
 #if DEBUG
                     Serial.print("NMEA message type is: ");
                     Serial.print(char(nmeaAddress1));
@@ -659,378 +937,401 @@ void loop() {
 #endif
                   }
                 }
-                // Check for asterisk '*'
+                // Now check if this is an '*'
                 if (c == '*') {
-                  // If asterix received do not exOR it into the checksum
+                  // Asterix received
+                  // Don't exOR it into the checksum
                   // Instead calculate what the expected checksum should be (nmeaChecksum in ASCII hex)
-                  nmeaExpectedChecksum1 = ((nmeaChecksum & 0xf0) >> 4) + '0'; // Convert MS nibble to ASCII hex
-                  if (nmeaExpectedChecksum1 >= ':') {
-                    nmeaExpectedChecksum1 += 7;  // Follows 9 so add 7 to convert to A-F
+                  nmea_expected_csum1 = ((nmeaChecksum & 0xf0) >> 4) + '0'; // Convert MS nibble to ASCII hex
+                  if (nmea_expected_csum1 >= ':') {
+                    nmea_expected_csum1 += 7;  // : follows 9 so add 7 to convert to A-F
                   }
-                  nmeaExpectedChecksum2 = (nmeaChecksum & 0x0f) + '0'; // Convert LS nibble to ASCII hex
-                  if (nmeaExpectedChecksum2 >= ':') {
-                    nmeaExpectedChecksum2 += 7;  // Follows 9 so add 7 to convert to A-F
+                  nmea_expected_csum2 = (nmeaChecksum & 0x0f) + '0'; // Convert LS nibble to ASCII hex
+                  if (nmea_expected_csum2 >= ':') {
+                    nmea_expected_csum2 += 7;  // : follows 9 so add 7 to convert to A-F
                   }
-                  parseStep = PARSE_NMEA_CHECKSUM_1; // Look for first checksum character
-                  break; // Do not include '*' in checksum
+                  // Next, look for the first csum character
+                  parseStep = PARSE_NMEA_CHECKSUM_1;
+                  break; // Don't include the * in the checksum
                 }
-                // Update the checksum
+                // Now update the checksum
                 // The checksum is the exclusive-OR of all characters between the $ and the *
                 nmeaChecksum = nmeaChecksum ^ c;
-              } // End case PARSE_NMEA_START_CHAR:
+              }
               break;
-
-            case PARSE_NMEA_CHECKSUM_1: {
-                // Store first NMEA checksum character
+            case (PARSE_NMEA_CHECKSUM_1): {
+                // Store the first NMEA checksum character
                 nmeaChecksum1 = c;
                 parseStep = PARSE_NMEA_CHECKSUM_2;
-              } // End case PARSE_NMEA_CHECKSUM_1:
+              }
               break;
-
-            case PARSE_NMEA_CHECKSUM_2: {
-                // Store second NMEA checksum character
+            case (PARSE_NMEA_CHECKSUM_2): {
+                // Store the second NMEA checksum character
                 nmeaChecksum2 = c;
-                // Check if checksum is correct
-                if ((nmeaChecksum1 != nmeaExpectedChecksum1) || (nmeaChecksum2 != nmeaExpectedChecksum2)) {
-                  // If checksum does not match, SYNC_LOST
-                  Serial.println("Warning: NMEA checksum error!");
+                // Now check if the checksum is correct
+                if ((nmeaChecksum1 != nmea_expected_csum1) or (nmeaChecksum2 != nmea_expected_csum2)) {
+                  // The checksum does not match so SYNC_LOST
+                  Serial.println("Warning! NMEA checksum error!");
                   parseStep = SYNC_LOST;
                 }
                 else {
                   // Checksum was valid so wait for the terminators
                   parseStep = PARSE_NMEA_END_1;
                 }
-              } // End case PARSE_NMEA_CHECKSUM_2:
+              }
               break;
-
-            case PARSE_NMEA_END_1: {
-                // Check for <CR>
+            case (PARSE_NMEA_END_1): {
+                // Check if this is CR
                 if (c != '\r') {
-                  Serial.println("Warning: NMEA CR not found!");
+                  Serial.println("Warning! NMEA CR not found!");
                   parseStep = SYNC_LOST;
                 }
                 else {
                   parseStep = PARSE_NMEA_END_2;
                 }
-              } // End case PARSE_NMEA_END_1:
+              }
               break;
-
-            case PARSE_NMEA_END_2: {
-                // Check for <LF>
+            case (PARSE_NMEA_END_2): {
+                // Check if this is LF
                 if (c != '\n') {
-                  Serial.println("Warning: NMEA LF not found!");
+                  Serial.println("Warning! NMEA LF not found!");
                   parseStep = SYNC_LOST;
                 }
                 else {
-                  // <LF> was received. Return to looking for '0xB5' or '$'
+                  // LF was received so go back to looking for B5 or a $
                   parseStep = PARSE_UBX_SYNC_CHAR_1;
                 }
-              } // End case PARSE_NMEA_END_2:
+              }
               break;
           }
         }
         else {
-          // Read battery voltage
+          // read battery voltage
           voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
         }
-
-        // Check for conditions that would halt logging
-        if (alarmFlag == true) {
-          if (myRTC.alarm(ALARM_1)) {
-            alarmFlag = true;
-          }
-          alarmFlag = false;
-        }
-
-        // Check if stop button was pressed
-        if (digitalRead(SW_PIN) == LOW) {
+        // Check if the stop button has been pressed or battery is low
+        // or if there has been an RTC alarm and it is time to open a new file
+        if (digitalRead(SW_PIN) == LOW) stopFlag = true;
+        if ((stopFlag == true) or (voltage < lowVoltage)) {
           loopStep = CLOSE_FILE; // Close the file
           break;
         }
-        // Check for low voltage
-        else if (voltage < lowBattery) {
-          loopStep = CLOSE_FILE; // Close the file
+        else if ((alarmFlag == true) and (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
+          loopStep = NEW_FILE; // Close the file and open a new one
           break;
         }
-        // Check if RTC alarm was triggered
-        else if ((alarmFlag == true) && (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
-          Serial.println("ALARM_1 Triggered");
-          loopStep = NEW_FILE; // Close current log file and create new file
-          break;
-        }
-        // Check if sync was lost
         else if (parseStep == SYNC_LOST) {
-          Serial.println("Sync lost");
-          loopStep = CLOSE_FILE; // If sync is lost, disable RAWX messages, close and open a new log file
+          Serial.println("Restarting file due to sync loss");
+          loopStep = RESTART_FILE; // Sync has been lost so stop RAWX messages and open a new file before restarting RAWX
         }
-      } // End case WRITE_FILE:
+      }
       break;
 
-    // Close current log file and open a new one without stopping RAWX messages
+    // Close the current log file and open a new one without stopping UBX messages
     case NEW_FILE: {
 
-#if DEBUG
         Serial.println("Case: NEW_FILE");
-#endif
-        // Write remaining data in serBuffer to log file
+
+        // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
-          numBytes = file.write(&serBuffer, bufferPointer); // Write data
+          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
-          bufferPointer = 0; // Reset bufferPointer
 #if DEBUG
           if (numBytes != sdPacket) {
-            Serial.print("Warning: ");
-            Serial.print(numBytes);
-            Serial.print(" bytes of ");
-            Serial.print(sdPacket);
-            Serial.println(" byte packet were written.");
+            Serial.print("Warning! SD write error. Only ");
+            Serial.print(numBytes); Serial.print("/");
+            Serial.print(bufferPointer); Serial.println(" bytes were written.");
           }
 #endif
+          bufferPointer = 0; // reset bufferPointer
         }
-
-        // Read current date and time
-        myRTC.read(tm);
 
         // Set the log file's last write/modification date and time
-        if (!file.timestamp(T_WRITE, (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second)) {
-          Serial.println("Warning: Could not set file write timestamp!");
+        if (!file.timestamp(T_WRITE, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file write timestamp!");
         }
         // Set log file's last access date and time
-        if (!file.timestamp(T_ACCESS, (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second)) {
-          Serial.println("Warning: Could not set file access timestamp!");
+        if (!file.timestamp(T_ACCESS, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file access timestamp!");
         }
 
-        // Close the log file
+        // Close the file
         file.close();
         Serial.println("File closed!");
 
 #if DEBUG
-        Serial.print("File size is: ");
-        Serial.println(file.fileSize());
-        Serial.print("File size should be: ");
-        Serial.println(bytesWritten);
+        uint32_t filesize = file.fileSize(); // Get the file size
+        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
 
-        // Set RTC alarm
-        alarmFlag = false; // Clear alarm flag
-        myRTC.read(tm);
-        printDateTime(myRTC.get()); Serial.println();
-
-        myRTC.setAlarm(ALM1_MATCH_MINUTES, 0, (tm.Minute + alarmInterval) % 60, 0, 0 ); // Calculate next alarm
-        //myRTC.setAlarm(ALM1_MATCH_HOURS, 0, 0, (tm.Hour + alarmInterval) % 24, 0 ); // Calculate next alarm
-        myRTC.alarm(ALARM_1); // Ensure alarm 1 interrupt flag is cleared
+        // An RTC alarm was detected, so set the RTC alarm time to the next alarmInterval and loop back to OPEN_FILE.
+        // We only receive an RTC alarm on a minute mark, so it doesn't matter that the RTC seconds will have moved on at this point.
+        alarmFlag = false; // Clear the RTC alarm flag
+        uint8_t rtc_mins = rtc.getMinutes(); // Read the RTC minutes
+        rtc_mins = rtc_mins + alarmInterval; // Add the alarmInterval to the RTC minutes
+        rtc_mins = rtc_mins % 60;           // Correct for hour rollover
+        rtc.setAlarmMinutes(rtc_mins); // Set next alarm time (minutes only - hours are ignored)
 
         loopStep = OPEN_FILE; // Loop to open a new file
-
-      } // End case NEW_FILE:
+        bytesWritten = 0;     // Clear bytesWritten
+      }
       break;
 
+    // Disable UBX messages, save any residual data and close the file
     case CLOSE_FILE: {
 
-#if DEBUG
         Serial.println("Case: CLOSE_FILE");
-#endif
-        // Disable UBX RAWX messages, save any residual data and close the log file
-        disableUbx();
-        //disableNmea();
 
-        // Wait for any residual data
-        uint16_t dwellCounter = 0;
-        while (dwellCounter < dwell) {
+        disableUbx(); // Disable RAWX messages
+        int waitcount = 0;
+        // Wait for residual data
+        while (waitcount < dwell) {
           while (SerialBuffer.available()) {
-            serBuffer[bufferPointer] = SerialBuffer.read_char(); // Place extra bytes in serBuffer
+            serBuffer[bufferPointer] = SerialBuffer.read_char(); // Put extra bytes into serBuffer
             bufferPointer++;
-            // Write a full packet
-            if (bufferPointer == sdPacket) {
+            if (bufferPointer == sdPacket) { // Write a full packet
               bufferPointer = 0;
               numBytes = file.write(&serBuffer, sdPacket);
               file.sync(); // Sync the file system
               bytesWritten += sdPacket;
+
+              // Blink LED to indicate SD card write
+              blinkLed(1, 50);
+
 #if DEBUG
               if (numBytes != sdPacket) {
-                Serial.print("Warning: SD write error! Write size was: ");
-                Serial.print(sdPacket);
-                Serial.print(", but ");
-                Serial.print(numBytes);
-                Serial.println(" were written.");
+                Serial.print("Warning! SD write error. Only ");
+                Serial.print(numBytes); Serial.print("/");
+                Serial.print(sdPacket); Serial.println(" bytes were written.");
               }
 #endif
             }
           }
-          dwellCounter++;
+          waitcount++;
           delay(1);
         }
-
-        // Write remaining data in serBuffer to log file
+        // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
-          numBytes = file.write(&serBuffer, bufferPointer); // Write data
+
+          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
 
+          // Blink LED to indicate SD card write
+          blinkLed(1, 50);
+
 #if DEBUG
           if (numBytes != sdPacket) {
-            Serial.print("Warning: ");
-            Serial.print(numBytes);
-            Serial.print(" bytes of ");
-            Serial.print(sdPacket);
-            Serial.println(" byte packet were written.");
+            Serial.print("Warning! SD write error. Only ");
+            Serial.print(numBytes); Serial.print("/");
+            Serial.print(bufferPointer); Serial.println(" bytes were written.");
           }
-          Serial.print("Final SD write: ");
-          Serial.print(bufferPointer);
-          Serial.println(" bytes");
-          Serial.print(bytesWritten);
-          Serial.println(" bytes written.");
+          Serial.print("Final SD write: "); Serial.print(bufferPointer);
+          Serial.print(" bytes. Total bytes written: "); Serial.println(bytesWritten);
 #endif
-          bufferPointer = 0; // Reset bufferPointer
+          // Reset bufferPointer
+          bufferPointer = 0;
         }
-
-        // Read current date and time
-        myRTC.read(tm);
 
         // Set the log file's last write/modification date and time
-        if (!file.timestamp(T_WRITE, (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second)) {
-          Serial.println("Warning: Could not set file write timestamp!");
+        if (!file.timestamp(T_WRITE, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file write timestamp!");
         }
         // Set log file's last access date and time
-        if (!file.timestamp(T_ACCESS, (tm.Year + 1970), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second)) {
-          Serial.println("Warning: Could not set file access timestamp!");
+        if (!file.timestamp(T_ACCESS, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file access timestamp!");
+        }
+
+        // Close the file
+        file.close();
+
+        // Blink LED to indicate SD card write
+        blinkLed(1, 50);
+
+#if DEBUG
+        uint32_t filesize = file.fileSize(); // Get the file size
+        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(". Expected file size: "); Serial.println(bytesWritten);
+#endif
+        Serial.println("File closed!");
+
+        // Either the battery is low or the user pressed the stop button:
+        if (stopFlag == true) {
+          // Stop switch was pressed so just wait for a reset
+
+          Serial.println("Waiting for reset...");
+          while (1); // Wait for reset
+        }
+        else {
+          // Low battery was detected so wait for the battery to recover
+          Serial.println("Battery must be low - waiting for it to recover...");
+
+          // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
+          int high_for = 0;
+          while (high_for < 500) {
+            // read battery voltage
+            voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
+            if (voltage < lowVoltage) {
+              high_for = 0; // If battery voltage is low, reset the count
+            }
+            else {
+              high_for++; // Increase the count
+            }
+            delay(10); // Wait 10 msec
+          }
+
+          // Loop to restart RAWX messages before opening a new file
+          digitalWrite(LED_BUILTIN, LOW); // Turn LED off
+
+          loopStep = START_UBX;
+        }
+      }
+      break;
+
+    // RAWX data lost sync so disable RAWX messages, save any residual data, close the file, open another and restart RAWX messages
+    // Don't update the next RTC alarm - leave it as it is
+    case RESTART_FILE: {
+
+        Serial.println("RESTART_FILE");
+
+        // Disable UBX messages
+        disableUbx();
+
+        int waitcount = 0;
+        while (waitcount < dwell) { // Wait for residual data
+          while (SerialBuffer.available()) {
+            serBuffer[bufferPointer] = SerialBuffer.read_char(); // Put extra bytes into serBuffer
+            bufferPointer++;
+            if (bufferPointer == sdPacket) { // Write a full packet
+              bufferPointer = 0;
+
+              digitalWrite(LED_BUILTIN, HIGH); // Turn the red LED on to indicate SD card write
+
+              numBytes = file.write(&serBuffer, sdPacket);
+              file.sync(); // Sync the file system
+
+              // Blink LED to indicate SD card write
+              blinkLed(1, 50);
+
+              bytesWritten += sdPacket;
+#if DEBUG
+              if (numBytes != sdPacket) {
+                Serial.print("Warning! SD write error. Only ");
+                Serial.print(numBytes); Serial.print("/");
+                Serial.print(sdPacket); Serial.println(" bytes were written.");
+              }
+#endif
+            }
+          }
+          waitcount++;
+          delay(1);
+        }
+        // If there is any data left in serBuffer, write it to file
+        if (bufferPointer > 0) {
+          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
+          file.sync(); // Sync the file system
+          bytesWritten += bufferPointer;
+
+          // Blink LED to indicate SD card write
+          blinkLed(1, 50);
+
+#if DEBUG
+          if (numBytes != sdPacket) {
+            Serial.print("Warning! SD write error. Only ");
+            Serial.print(numBytes); Serial.print("/");
+            Serial.print(bufferPointer); Serial.println(" bytes were written.");
+          }
+          Serial.print("Final SD Write: ");
+          Serial.print(bufferPointer);
+          Serial.println(" Bytes");
+          Serial.print(bytesWritten);
+          Serial.println(" Bytes written");
+#endif
+
+          // Reset bufferPointer
+          bufferPointer = 0;
+        }
+
+        digitalWrite(LED_BUILTIN, HIGH); // Blink LED to indicate SD card write
+
+        // Set the log file's last write/modification date and time
+        if (!file.timestamp(T_WRITE, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file write timestamp!");
+        }
+        // Set log file's last access date and time
+        if (!file.timestamp(T_ACCESS, rtc.getYear() + 2000, rtc.getMonth(), rtc.getDay(), rtc.getHours(), rtc.getMinutes(), rtc.getSeconds())) {
+          Serial.println("Warning: Unable to set file access timestamp!");
         }
 
         // Close the log file
         file.close();
-        Serial.println("File closed!");
+
+        digitalWrite(LED_BUILTIN, LOW); // Blink LED to indicate SD card write
 
 #if DEBUG
-        Serial.print("File size is: ");
-        Serial.println(file.fileSize());
-        Serial.print("File size should be: ");
-        Serial.println(bytesWritten);
+        uint32_t filesize = file.fileSize(); // Get the file size
+        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
-
-        // Halt program if stop button was pressed
-        if (digitalRead(SW_PIN) == LOW) {
-          Serial.println("Waiting for reset...");
-          while (1); // Halt the program
-        }
-        // If low voltage, go to sleep
-        else if (voltage < lowBattery) {
-          loopStep = SLEEP;
-          break;
-        }
-        else if (parseStep == SYNC_LOST) {
-          loopStep = START_UBX;
-          break;
-        }
-      } // End case CLOSE_FILE:
+        Serial.println("File closed!");
+        loopStep = START_UBX; // Loop to restart UBX messages before opening a new file
+      } // case RESTART_FILE
       break;
 
     case SLEEP: {
 
-#if DEBUG
         Serial.println("Case: SLEEP");
-#endif
+        // Set alarm
+
+        // Go to deep sleep
         //LowPower.deepSleep();
 
         loopStep = WAKE;
-      } // End case SLEEP:
+      } // case SLEEP
       break;
 
     case WAKE: {
 
-#if DEBUG
         Serial.println("Case: WAKE");
-#endif
 
-        loopStep = START;
-      } // End case WAKE:
+        loopStep = INIT;
+      } // case WAKE
       break;
+  }
+}
 
-  } // End switch (loopStep)
 
-} // End loop()
-
-// RTC alarm interrupt service routine (ISR).
-void alarmIsr() {
+// RTC alarm interrupt
+void alarmMatch() {
   alarmFlag = true; // Set alarm flag
 }
 
-// Print current time and date.
-void printDateTime(time_t t) {
-  char dateBuffer[25];
-  snprintf(dateBuffer, sizeof(dateBuffer), "%04u-%02d-%02d %02d:%02d:%02d",
-           year(t), month(t), day(t), hour(t), minute(t), second(t));
-  Serial.print(dateBuffer);
+// Print the RTC's current time and date
+void printDateTime() {
+  char dateTimeBuffer[25];
+  snprintf(dateTimeBuffer, sizeof(dateTimeBuffer), "%04u-%02d-%02d %02d:%02d:%02d",
+           (rtc.getYear() + 2000), rtc.getMonth(), rtc.getDay(),
+           rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+  Serial.println(dateTimeBuffer);
 }
 
-// TimerCounter3 functions to copy Serial1 receive data into SerialBuffer.
-// Defines SerialBuffer as a large RingBuffer that will store Serial1 received
-// data using a timer interrupt. Avoids having to increase the size of the
-// Serial1 receive buffer by editing RingBuffer.h
-// Use DEBUG_SERIAL_BUFFER to determine size of buffer.
-// Increase if bufferAvailable nears or reaches the buffer size.
-// https://gist.github.com/jdneo/43be30d85080b175cb5aed3500d3f989
-#define CPU_HZ 48000000
-#define TIMER_PRESCALER_DIV 16
-
-// Set TC3 Interval (sec)
-void setTimerInterval(float intervalS) {
-  int compareValue = intervalS * CPU_HZ / TIMER_PRESCALER_DIV;
-  if (compareValue > 65535) compareValue = 65535;
-  TcCount16* TC = (TcCount16*) TC3;
-  // Make sure the count is in a proportional position to where it was
-  // to prevent any jitter or disconnect when changing the compare value.
-  TC->COUNT.reg = map(TC->COUNT.reg, 0, TC->CC[0].reg, 0, compareValue);
-  TC->CC[0].reg = compareValue;
-  while (TC->STATUS.bit.SYNCBUSY == 1);
-}
-
-// Start TC3 with a specified interval
-void startTimerInterval(float intervalS) {
-  REG_GCLK_CLKCTRL = (uint16_t) (GCLK_CLKCTRL_CLKEN | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_ID_TCC2_TC3) ;
-  while ( GCLK->STATUS.bit.SYNCBUSY == 1 ); // Wait for sync
-
-  TcCount16* TC = (TcCount16*) TC3;
-
-  TC->CTRLA.reg &= ~TC_CTRLA_ENABLE;
-  while (TC->STATUS.bit.SYNCBUSY == 1); // Wait for sync
-
-  // Use the 16-bit timer
-  TC->CTRLA.reg |= TC_CTRLA_MODE_COUNT16;
-  while (TC->STATUS.bit.SYNCBUSY == 1); // Wait for sync
-
-  // Use match mode so that the timer counter resets when the count matches the compare register
-  TC->CTRLA.reg |= TC_CTRLA_WAVEGEN_MFRQ;
-  while (TC->STATUS.bit.SYNCBUSY == 1); // Wait for sync
-
-  // Set prescaler to 16
-  TC->CTRLA.reg |= TC_CTRLA_PRESCALER_DIV16;
-  while (TC->STATUS.bit.SYNCBUSY == 1); // Wait for sync
-
-  setTimerInterval(intervalS);
-
-  // Enable the compare interrupt
-  TC->INTENSET.reg = 0;
-  TC->INTENSET.bit.MC0 = 1;
-
-  NVIC_SetPriority(TC3_IRQn, 3); // Set the TC3 interrupt priority to 3 (lowest)
-  NVIC_EnableIRQ(TC3_IRQn);
-
-  TC->CTRLA.reg |= TC_CTRLA_ENABLE;
-  while (TC->STATUS.bit.SYNCBUSY == 1); // Wait for sync
-}
-
-// TC3 Interrupt Handler
-void TC3_Handler() {
-  TcCount16* TC = (TcCount16*) TC3;
-  // If this interrupt is due to the compare register matching the timer count
-  // copy any available Serial1 data into SerialBuffer
-  if (TC->INTFLAG.bit.MC0 == 1) {
-    TC->INTFLAG.bit.MC0 = 1;
-    int available1 = Serial1.available(); // Check if there is any data waiting in the Serial1 RX buffer
-    while (available1 > 0) {
-      SerialBuffer.store_char(Serial1.read()); // If there is, copy it into our RingBuffer
-      available1--;
+// Blink LED
+void blinkLed(uint8_t flashes, uint32_t interval) {
+  uint8_t i = 0;
+  while (i < flashes) {
+    uint32_t currentMillis = millis();
+    if (currentMillis - previousMillis >= interval) {
+      previousMillis = currentMillis;
+      if (ledState == LOW) {
+        ledState = HIGH;
+      }
+      else {
+        ledState = LOW;
+      }
+      digitalWrite(LED_BUILTIN, ledState);
+      i++;
     }
   }
 }
