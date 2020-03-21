@@ -1,6 +1,6 @@
 /*
   Title:    ZED-F9P Raw Data Logger
-  Date:     March 19, 2020
+  Date:     March 21, 2020
   Author:   Adam Garbo
 
   Description:
@@ -27,11 +27,11 @@
 #include <Wire.h>                           // https://www.arduino.cc/en/Reference/Wire
 
 // Debugging definitons
-#define DEBUG               true  // Debugging output to Serial Monitor
-#define DEBUG_I2C           false // I2C debugging output to Serial Monitor
-#define DEBUG_NMEA          false // NMEA debugging output to Serial Monitor
+#define DEBUG               true  // Output debug messages to Serial Monitor
+#define DEBUG_I2C           false // Output I2C debug messages to Serial Monitor
+#define DEBUG_NMEA          false // Output NMEA debug messages to Serial Monitor
 #define DEBUG_SERIAL_BUFFER false // Displays a message each time SerialBuffer.available reaches a new maximum
-#define DEBUG_UBX           false // UBX debugging output to Serial Monitor
+#define DEBUG_UBX           false // Output UBX debug messages to Serial Monitor
 #define NO_LED              false // Disable all LEDs
 
 // Pin assignments
@@ -47,7 +47,7 @@ SdFile        file;
 SFE_UBLOX_GPS gnss;
 
 // User-declared global variables and constants
-unsigned long alarmInterval   = 10;      // Creates a new log file every alarmInterval minutes
+unsigned long alarmInterval   = 3;      // Creates a new log file every alarmInterval hours
 const int     maxValFix       = 10;     // Number of valid GNSS fixes to collect before starting to log data
 const int     dwell           = 1100;   // How long to wait in msec for residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
 const float   lowVoltage      = 3.55;   // Low battery voltage threshold
@@ -159,9 +159,9 @@ uint8_t disableUbx() {
   gnss.addCfgValset8(0x2091002a, 0x00);                 // CFG-MSGOUT-UBX_NAV_POSLLH_UART1
   gnss.addCfgValset8(0x20910007, 0x00);                 // CFG-MSGOUT-UBX_NAV_PVT_UART1
   gnss.addCfgValset8(0x2091001b, 0x00);                 // CFG-MSGOUT-UBX_NAV_STATUS_UART1
-  gnss.addCfgValset8(0x20930031, 0x01);                 // CFG-NMEA-MAINTALKERID - Sets the main talker ID to GP
-  gnss.addCfgValset8(0x10930006, 0x00);                 // CFG-NMEA-HIGHPREC - Disables NMEA high-precision mode
-  return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1 - Disables the GGA message
+  gnss.addCfgValset8(0x20930031, 0x01);                 // CFG-NMEA-MAINTALKERID            Sets the main talker ID to GP
+  gnss.addCfgValset8(0x10930006, 0x00);                 // CFG-NMEA-HIGHPREC                Disables NMEA high-precision mode
+  return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1     Disables the GGA message
 }
 
 // Enables all messages to be logged to the SD card
@@ -172,9 +172,9 @@ uint8_t enableUbx() {
   //gnss.addCfgValset8(0x2091002a, 0x01);               // CFG-MSGOUT-UBX_NAV_POSLLH_UART1
   //gnss.addCfgValset8(0x20910007, 0x01);               // CFG-MSGOUT-UBX_NAV_PVT_UART1
   //gnss.addCfgValset8(0x2091001b, 0x01);               // CFG-MSGOUT-UBX_NAV_STATUS_UART1
-  //gnss.addCfgValset8(0x20930031, 0x03);               // CFG-NMEA-MAINTALKERID - This line sets the main talker ID to GN
-  //gnss.addCfgValset8(0x10930006, 0x01);               // CFG-NMEA-HIGHPREC - Enables NMEA high-precision mode
-  return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1 - Enables the GGA mesage
+  //gnss.addCfgValset8(0x20930031, 0x03);               // CFG-NMEA-MAINTALKERID            Sets the main talker ID to GN
+  //gnss.addCfgValset8(0x10930006, 0x01);               // CFG-NMEA-HIGHPREC                Enables NMEA high-precision mode
+  return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1     Enables the GGA mesage
 }
 
 // Enable NMEA messages on UART1
@@ -562,13 +562,17 @@ void loop() {
           // Set the RTC's date and time
           alarmFlag = false; // Clear alarm flag
           rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond()); // Set the time
-          rtc.setDate(gnss.getDay(), gnss.getMonth(), (uint8_t)(gnss.getYear() - 2000)); // Set the date
-          rtc.setAlarmSeconds(0); // Set RTC Alarm Seconds to zero
+          rtc.setDate(gnss.getDay(), gnss.getMonth(), gnss.getYear() - 2000); // Set the date
+          Serial.print("RTC set: "); printDateTime();
 
           // Set the RTC's alarm
-          uint8_t nextAlarmMin = ((gnss.getMinute() + alarmInterval) / alarmInterval) * alarmInterval; // Calculate next alarm minutes
-          rtc.setAlarmMinutes(nextAlarmMin % 60);  // Correct hour rollover and set RTC Alarm Minutes
-          rtc.enableAlarm(rtc.MATCH_MMSS);    // Alarm match on minutes and seconds
+          //rtc.setAlarmTime(0, (rtc.getMinutes() + alarmInterval) % 60, 0);  // Calculate next alarm minutes
+          rtc.setAlarmTime((rtc.getHours() + alarmInterval) % 24, 0, 0);      // Set alarm time (hours, minutes, seconds)
+
+          Serial.println("Next alarm: "); printAlarm();
+
+          rtc.enableAlarm(rtc.MATCH_HHMMSS);  // Alarm match on hours, minutes and seconds
+          //rtc.enableAlarm(rtc.MATCH_MMSS);    // Alarm match on minutes and seconds
           rtc.attachInterrupt(alarmMatch);    // Attach alarm interrupt
 
           // Check if voltage is > lowVoltage, if not then don't try to log any data
@@ -1091,9 +1095,13 @@ void loop() {
         // An RTC alarm was detected, so set the RTC alarm time to the next alarmInterval and loop back to OPEN_FILE.
         // We only receive an RTC alarm on a minute mark, so it doesn't matter that the RTC seconds will have moved on at this point.
         alarmFlag = false; // Clear the RTC alarm flag
-        uint8_t alarmMin = rtc.getMinutes(); // Read the RTC minutes
-        alarmMin = alarmMin + alarmInterval; // Add the alarmInterval to the RTC minutes
-        rtc.setAlarmMinutes(alarmMin % 60); // Correct for hour rollover and set next alarm time (minutes only - hours are ignored)
+        //rtc.setAlarmMinutes((rtc.getMinutes() + alarmInterval) % 60); // Correct for hour rollover and set next alarm time (minutes only - hours are ignored)
+
+        rtc.setAlarmTime((rtc.getHours() + alarmInterval) % 24, 0, 0);  // Hours, minutes, seconds
+        rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
+        rtc.attachInterrupt(alarmMatch);                                // Attach alarm interrupt
+
+        Serial.println("Next alarm: "); printAlarm();
 
         loopStep = OPEN_FILE; // Loop to open a new file
         bytesWritten = 0;     // Clear bytesWritten
@@ -1333,6 +1341,15 @@ void printDateTime() {
            (rtc.getYear() + 2000), rtc.getMonth(), rtc.getDay(),
            rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
   Serial.println(dateTimeBuffer);
+}
+
+// Print the RTC's current time and date
+void printAlarm() {
+  char alarmBuffer[25];
+  snprintf(alarmBuffer, sizeof(alarmBuffer), "%04u-%02d-%02d %02d:%02d:%02d",
+           rtc.getAlarmYear() + 2000, rtc.getAlarmMonth(), rtc.getAlarmDay(),
+           rtc.getAlarmHours(), rtc.getAlarmMinutes(), rtc.getAlarmSeconds());
+  Serial.println(alarmBuffer);
 }
 
 // Blink LED
