@@ -16,6 +16,8 @@
   Comments:
   This code is based heaivly on Paul Clark's F9P_RAWX_Logger:
   https://github.com/PaulZC/ZED-F9P_FeatherWing_USB
+  - Deployed at 2020-03-21 15:40 (19:40 UTC) to test file sizes of ALL data.
+  - Will recover in ~3 hours (21:00 UTC)
 */
 
 // Libraries
@@ -29,16 +31,24 @@
 // Debugging definitons
 #define DEBUG               true  // Output debug messages to Serial Monitor
 #define DEBUG_I2C           false // Output I2C debug messages to Serial Monitor
-#define DEBUG_NMEA          false // Output NMEA debug messages to Serial Monitor
+#define DEBUG_NAV           false // Output NAV_PVT debug messages to Serial Monitor
 #define DEBUG_SERIAL_BUFFER false // Displays a message each time SerialBuffer.available reaches a new maximum
 #define DEBUG_UBX           false // Output UBX debug messages to Serial Monitor
-#define NO_LED              false // Disable all LEDs
+
+// LEDs
+#define LED_ON  true  // Enable LEDs
+#define LED_PIN 8     // Indicates that the GNSS has established a fix
 
 // Pin assignments
-#define LED_PIN     8   // Indicates that the GNSS has established a fix
+#define GPS_INT_PIN 5
 #define MODE_PIN    6   // Connect MODE_PIN to GND to select base mode. Leave open for rover mode.
 #define SURVEY_PIN  A3  // Connect to GND to select SURVEY_IN mode when in BASE mode
 #define SW_PIN      10  // Connect a normally-open push-to-close switch between SW_PIN and GND to halt logging and close the log file
+
+// Select alarm to set
+#define ALARM_MIN false // Enable rolling-minutes alarm
+#define ALARM_HR  true  // Enable rolling-hours alarm
+#define ALARM_DAY false // Enable rolling-day alarm
 
 // Object instantiations
 RTCZero       rtc;
@@ -47,18 +57,21 @@ SdFile        file;
 SFE_UBLOX_GPS gnss;
 
 // User-declared global variables and constants
-unsigned long alarmInterval   = 3;      // Creates a new log file every alarmInterval hours
-const int     maxValFix       = 10;     // Number of valid GNSS fixes to collect before starting to log data
+const byte    alarmMinutes    = 10;     // Creates a new log file every alarmMinutes
+const byte    alarmHours      = 1;      // Creates a new log file every alarmHours
+const int     maxValFix       = 10;     // Minimum number of valid GNSS fixes to collect before beginning to log data
 const int     dwell           = 1100;   // How long to wait in msec for residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
-const float   lowVoltage      = 3.55;   // Low battery voltage threshold
+const float   lowVoltage      = 3.5;   // Low battery voltage threshold
 
 // Global flag variable delcarations
 volatile bool alarmFlag       = false;  // RTC alarm interrupt service routine flag
 volatile bool sleepFlag       = false;  // Flag to indicate to Watchdog Timer if in deep sleep mode
+volatile byte watchdogCounter = 0;      // Watchdog interrupt service routine counter
 bool          stopFlag        = false;  // Flag to indicate if stop switch was pressed to stop logging
 bool          surveyFlag      = false;  // Flag to indicate if the code is in SURVEY_IN mode
 bool          modeFlag        = true;   // Flag to indicate if the code is in base or rover mode. true = BASE mode, false = ROVER mode
 bool          ledState        = LOW;    // Flag to toggle LED in blinkLed() function
+bool          voltageFlag     = false;  // Flag to indiciate low battery voltage
 
 // Global variables and constant declarations
 const byte    chipSelect      = 4;      // SD card chip select
@@ -131,6 +144,37 @@ const int maxNmeaLength   = 100; // Maximum length for an NMEA message used to d
 
 // Definitions for u-blox F9P UBX-format (binary) messages
 
+// Configure u-blox ZED-F9P receiver for ON/OFF operation (UBX-CFG-PM2)
+static uint8_t ubxCfgPm2_payload[] = {
+  0x01, 0x06, 0x00, 0x00, 0x6E, 0x00, 0x42, 0x01, 0xE8, 0x03, 0x00,
+  0x00, 0x10, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x4F, 0xC1, 0x03, 0x00, 0x86,
+  0x02, 0x00, 0x00, 0xFE, 0x00, 0x00, 0x00, 0x64, 0x40, 0x01, 0x00
+};
+
+ubxPacket ubxCfgPm2 = {
+  0x06, 0x3b, 44, 0, 0, ubxCfgPm2_payload, 0, 0, false
+};
+
+// Satellite systems (GNSS) signal configuration. Enable GPS/GLO and disable GAL/BDS/QZSS. Warning: Will cause receiver reset!
+uint8_t configureGnss() {
+  gnss.newCfgValset8(0x1031001f, 0x01, VAL_LAYER_RAM); // CFG-SIGNAL-GPS_ENA
+  gnss.addCfgValset8(0x10310001, 0x01);                // CFG-SIGNAL-GPS_L1CA_ENA
+  gnss.addCfgValset8(0x10310003, 0x01);                // CFG-SIGNAL-GPS_L2C_ENA
+  gnss.addCfgValset8(0x10310021, 0x00);                // CFG-SIGNAL-GAL_ENA
+  gnss.addCfgValset8(0x10310007, 0x00);                // CFG-SIGNAL-GAL_E1_ENA
+  gnss.addCfgValset8(0x1031000a, 0x00);                // CFG-SIGNAL-GAL_E5B_ENA
+  gnss.addCfgValset8(0x10310022, 0x00);                // CFG-SIGNAL-BDS_ENA
+  gnss.addCfgValset8(0x1031000d, 0x00);                // CFG-SIGNAL-BDS_B1_ENA
+  gnss.addCfgValset8(0x1031000e, 0x00);                // CFG-SIGNAL-BDS_B2_ENA
+  gnss.addCfgValset8(0x10310024, 0x00);                // CFG-SIGNAL-QZSS_ENA
+  gnss.addCfgValset8(0x10310012, 0x00);                // CFG-SIGNAL-QZSS_L1CA_ENA
+  gnss.addCfgValset8(0x10310015, 0x00);                // CFG-SIGNAL-QZSS_L2C_ENA
+  gnss.addCfgValset8(0x10310025, 0x01);                // CFG-SIGNAL-GLO_ENA
+  gnss.addCfgValset8(0x10310018, 0x01);                // CFG-SIGNAL-GLO_L1_ENA
+  return gnss.sendCfgValset8(0x1031001a, 0x01);        // CFG-SIGNAL-GLO_L2_ENA
+}
+
 // Disable NMEA output on the I2C port
 uint8_t disableI2cNmea() {
   return gnss.setVal8(0x10720002, 0x00, VAL_LAYER_RAM);
@@ -164,18 +208,27 @@ uint8_t disableUbx() {
   return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1     Disables the GGA message
 }
 
-// Enables all messages to be logged to the SD card
+
+// Enable UBX RAWX and SFRBX messages on UART1
 uint8_t enableUbx() {
+  gnss.newCfgValset8(0x209102a5, 0x01, VAL_LAYER_RAM); // CFG-MSGOUT-UBX_RXM_RAWX_UART1
+  return gnss.sendCfgValset8(0x20910232, 0x01);        // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
+}
+
+/*
+  // Enables all messages to be logged to the SD card
+  uint8_t enableUbx() {
   gnss.newCfgValset8(0x209102a5, 0x01, VAL_LAYER_RAM);  // CFG-MSGOUT-UBX_RXM_RAWX_UART1
   gnss.addCfgValset8(0x20910232, 0x01);                 // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
   gnss.addCfgValset8(0x20910179, 0x01);                 // CFG-MSGOUT-UBX_TIM_TM2_UART1
-  //gnss.addCfgValset8(0x2091002a, 0x01);               // CFG-MSGOUT-UBX_NAV_POSLLH_UART1
-  //gnss.addCfgValset8(0x20910007, 0x01);               // CFG-MSGOUT-UBX_NAV_PVT_UART1
-  //gnss.addCfgValset8(0x2091001b, 0x01);               // CFG-MSGOUT-UBX_NAV_STATUS_UART1
-  //gnss.addCfgValset8(0x20930031, 0x03);               // CFG-NMEA-MAINTALKERID            Sets the main talker ID to GN
-  //gnss.addCfgValset8(0x10930006, 0x01);               // CFG-NMEA-HIGHPREC                Enables NMEA high-precision mode
+  gnss.addCfgValset8(0x2091002a, 0x01);                 // CFG-MSGOUT-UBX_NAV_POSLLH_UART1
+  gnss.addCfgValset8(0x20910007, 0x01);                 // CFG-MSGOUT-UBX_NAV_PVT_UART1
+  gnss.addCfgValset8(0x2091001b, 0x01);                 // CFG-MSGOUT-UBX_NAV_STATUS_UART1
+  gnss.addCfgValset8(0x20930031, 0x03);                 // CFG-NMEA-MAINTALKERID            Sets the main talker ID to GN
+  gnss.addCfgValset8(0x10930006, 0x01);                 // CFG-NMEA-HIGHPREC                Enables NMEA high-precision mode
   return gnss.sendCfgValset8(0x209100bb, 0x00);         // CFG-MSGOUT-NMEA_ID_GGA_UART1     Enables the GGA mesage
-}
+  }
+*/
 
 // Enable NMEA messages on UART1
 uint8_t enableNmea() {
@@ -353,7 +406,7 @@ void startTimerInterval(float intervalS) {
 
   setTimerInterval(intervalS);
 
-  // Enable the compare interrupt
+  // Enable the compare interruptl
   TC->INTENSET.reg = 0;
   TC->INTENSET.bit.MC0 = 1;
 
@@ -386,6 +439,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(MODE_PIN, INPUT_PULLUP);    // Input for the Base/Rover mode select switch
+  pinMode(GPS_INT_PIN, OUTPUT);       //
   pinMode(SW_PIN, INPUT_PULLUP);      // Input for the stop switch
   pinMode(SURVEY_PIN, INPUT_PULLUP);  // Input for the SURVEY_IN switch
 
@@ -412,6 +466,7 @@ void setup() {
   delay(5000);       // Delay to allow user to open Serial Monitor
 
   Serial.println("u-blox ZED-F9P Raw Datalogger");
+  Serial.println("-----------------------------");
 
   // Initialize I2C
   Wire.begin();
@@ -433,9 +488,11 @@ void setup() {
 
   // Initialize the u-blox ZED-F9P
   if (gnss.begin() == true) {
-    Serial.println("u-blox ZED-F9P initialized."); // Connect to the u-blox ZED-F9P using the Wire (I2C) interface
+    Serial.println("u-blox ZED-F9P initialized.");
+    //gnss.sendCommand(ubxCfgPm2);  // Configure UBX-CFG-PM2 for ON/OFF operation
+    //gnss.saveConfiguration();     // Save current settings to flash and BBR
 #if DEBUG_I2C
-    gnss.enableDebugging(); // Enable I2C debug output to Serial Monitor
+    gnss.enableDebugging();       // Enable I2C debug output to Serial Monitor
 #endif
   }
   else {
@@ -454,6 +511,8 @@ void setup() {
   // These sendCommands will timeout as the commandAck checking in processUBXpacket expects the packet to be in packetCfg, not our custom packet!
   // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:5 ID:1 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
   boolean setValueSuccess = true;
+
+  setValueSuccess &= configureGnss();       // Configure GNSS constellations
   setValueSuccess &= disableI2cNmea();      // Disable NMEA messages on the I2C port leaving it clear for UBX messages
   setValueSuccess &= setUart1Baud();        // Change the UART1 baud rate to 230400
   setValueSuccess &= disableUbx();          // Disable UBX messages and NMEA high precision mode on UART1
@@ -494,8 +553,8 @@ void setup() {
     //setNavWrist(); // Set Wrist Navigation Mode
   }
 
-#if NO_LED
-  disableTP1(); // Disable the timepulse to stop the LED from flashing
+#if !LED_ON
+  disableTP1(); // Disable the timepulse to prevent the LED from flashing
 #endif
 
   // Start Serial1 at 230400 baud
@@ -514,7 +573,7 @@ void loop() {
   switch (loopStep) {
     case INIT: {
 
-        // Reset Watchdog Timer
+        // Pet the dog
         resetWatchdog();
 
 #if DEBUG
@@ -545,50 +604,50 @@ void loop() {
 
         // Has a GNSS fix been acquired?
         if (gnss.getFixType() > 0) {
-          digitalWrite(LED_PIN, HIGH); // Turn on LED indicate GNSS fix
-
+#if LED_ON
+          digitalWrite(LED_PIN, HIGH); // Turn LED ON to indicate GNSS fix
+#endif
           // Increment valFix and cap at maxValFix
           // don't do anything fancy in terms of decrementing valFix as we want to keep logging even if the fix is lost
           valFix += 1;
           if (valFix > maxValFix) valFix = maxValFix;
         }
         else {
-          digitalWrite(LED_PIN, LOW); // Turn LED off
+#if LED_ON
+          digitalWrite(LED_PIN, LOW); // Turn LED OFF to indicate loss of GNSS fix
+#endif
         }
 
-        // Wait until enough valid GNSS fixes have been collected
+        // Have enough valid GNSS fixes been collected?
         if (valFix == maxValFix) {
 
           // Set the RTC's date and time
-          alarmFlag = false; // Clear alarm flag
-          rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond()); // Set the time
+          rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond());    // Set the time
           rtc.setDate(gnss.getDay(), gnss.getMonth(), gnss.getYear() - 2000); // Set the date
           Serial.print("RTC set: "); printDateTime();
 
           // Set the RTC's alarm
-          //rtc.setAlarmTime(0, (rtc.getMinutes() + alarmInterval) % 60, 0);  // Calculate next alarm minutes
-          rtc.setAlarmTime((rtc.getHours() + alarmInterval) % 24, 0, 0);      // Set alarm time (hours, minutes, seconds)
+          alarmFlag = false; // Clear alarm flag
+#if ALARM_MIN
+          // Rolling-minutes alarm
+          rtc.setAlarmTime(0, (rtc.getMinutes() + alarmMinutes) % 60, 0); // Set alarm time (hour, minute, second)
+          rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
+          rtc.enableAlarm(rtc.MATCH_MMSS);                                // Alarm match on minutes and seconds
+#else if ALARM_HR
+          // Rolling-hour alarm
+          rtc.setAlarmTime((rtc.getHours() + alarmHours) % 24, 0, 0);     // Set alarm time (hours, minutes, seconds)
+          rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
+          rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
+#endif
+          rtc.attachInterrupt(alarmMatch);  // Attach alarm interrupt
+          Serial.print("Next alarm: "); printAlarm();
 
-          Serial.println("Next alarm: "); printAlarm();
-
-          rtc.enableAlarm(rtc.MATCH_HHMMSS);  // Alarm match on hours, minutes and seconds
-          //rtc.enableAlarm(rtc.MATCH_MMSS);    // Alarm match on minutes and seconds
-          rtc.attachInterrupt(alarmMatch);    // Attach alarm interrupt
-
-          // Check if voltage is > lowVoltage, if not then don't try to log any data
+          // Halt logging if battery voltage is below lowVoltage threshold
           if (voltage < lowVoltage) {
-            Serial.println("Warning: Low Battery.");
+            Serial.println("Warning: Low battery!");
             loopStep = SLEEP;
             break;
           }
-
-          // Set the RAWX measurement rate
-          //setRate20Hz(); // Set Navigation/Measurement Rate to 20 Hz
-          //setRate10Hz(); // Set Navigation/Measurement Rate to 10 Hz
-          //setRate5Hz(); // Set Navigation/Measurement Rate to 5 Hz
-          //setRate4Hz(); // Set Navigation/Measurement Rate to 4 Hz
-          //setRate2Hz(); // Set Navigation/Measurement Rate to 2 Hz
-          setRate1Hz(); // Set Navigation/Measurement Rate to 1 Hz
 
           // If we are in BASE mode, check the SURVEY_IN pin
           if (modeFlag == true) {
@@ -625,7 +684,8 @@ void loop() {
         enableUbx(); // Start the UBX and NMEA messages
         bufferPointer = 0; // Initialise bufferPointer
 
-        loopStep = OPEN_FILE; // Start logging UBX data
+        // Create a new log file
+        loopStep = OPEN_FILE;
       }
       break;
 
@@ -633,6 +693,9 @@ void loop() {
     case OPEN_FILE: {
 
         Serial.println("Case: OPEN_FILE");
+
+        // Pet the dog
+        resetWatchdog();
 
         // Create a new folder
         snprintf(dirName, sizeof(dirName), "%04u%02d%02d", (rtc.getYear() + 2000), rtc.getMonth(), rtc.getDay());
@@ -662,9 +725,10 @@ void loop() {
         }
 
         bytesWritten = 0;                   // Clear bytesWritten
-        parseStep = PARSE_UBX_SYNC_CHAR_1;  // Set parseStep to expect B5 or $
+        parseStep = PARSE_UBX_SYNC_CHAR_1;  // Set parseStep to expect 0xB5 or '$'
         ubxLength = 0;                      // Set ubxLength to zero
 
+        // Begin logging data
         loopStep = WRITE_FILE;
 
       } // End case OPEN_FILE
@@ -695,23 +759,15 @@ void loop() {
           Serial.print(dataString);
 #endif
 
-#if DEBUG_NMEA
-          // Output NMEA sentences to Serial Monitor
-          Serial.print(char(c));
-#endif
-
           bufferPointer++;
           if (bufferPointer == sdPacket) {
-            resetWatchdog(); // Reset Watchdog Timer
             bufferPointer = 0;
-            digitalWrite(LED_BUILTIN, HIGH); // Blink the LED to indicate an SD write
-
             numBytes = file.write(&serBuffer, sdPacket);
             file.sync(); // Sync the file system
             bytesWritten += sdPacket;
 
-            resetWatchdog();  // Reset Watchdog Timer
-
+            // Blink the LED to indicate SD write
+            blinkLed(1, 50);
 #if DEBUG
             if (numBytes != sdPacket) {
               Serial.print("Warning: SD write error. Only ");
@@ -777,12 +833,13 @@ void loop() {
                 }
               }
               break;
-            // RXM_RAWX is class 0x02 ID 0x15
-            // RXM_SFRBF is class 0x02 ID 0x13
-            // TIM_TM2 is class 0x0d ID 0x03
-            // NAV_POSLLH is class 0x01 ID 0x02
-            // NAV_PVT is class 0x01 ID 0x07
-            // NAV-STATUS is class 0x01 ID 0x03
+            // Message      Class   ID
+            // RXM_RAWX     0x02    0x15
+            // RXM_SFRBF    0x02    0x13
+            // TIM_TM2      0x0d    0x03
+            // NAV_POSLLH   0x01    0x02
+            // NAV_PVT      0x01    0x07
+            // NAV-STATUS   0x01    0x03
             case (PARSE_UBX_CLASS): {
                 ubxClass = c;
                 ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
@@ -837,16 +894,16 @@ void loop() {
                 // If this is a NAV_PVT message, check the flags byte (byte offset 21) and report the carrSoln
                 if ((ubxClass == 0x01) && (ubxId == 0x07)) { // Is this a NAV_PVT message (class 0x01 ID 0x07)?
                   if (ubxLength == 71) { // Is this byte offset 21? (ubxLength will be 92 for byte offset 0, so will be 71 for byte offset 21)
-#if DEBUG
+#if DEBUG_NAV
                     Serial.print("NAV_PVT carrSoln: ");
                     if ((c & 0xc0) == 0x00) {
-                      Serial.println("none");
+                      Serial.println("None");
                     }
                     else if ((c & 0xc0) == 0x40) {
-                      Serial.println("floating");
+                      Serial.println("Floating");
                     }
                     else if ((c & 0xc0) == 0x80) {
-                      Serial.println("fixed");
+                      Serial.println("Fixed");
                     }
 #endif
                     // Have we got a fixed carrier solution?
@@ -857,7 +914,7 @@ void loop() {
                 // If this is a NAV_STATUS message, check the gpsFix byte (byte offset 4) and flash the green LED if the fix is TIME
                 if ((ubxClass == 0x01) && (ubxId == 0x03)) { // Is this a NAV_STATUS message (class 0x01 ID 0x03)?
                   if (ubxLength == 12) { // Is this byte offset 4? (ubxLength will be 16 for byte offset 0, so will be 12 for byte offset 4)
-#if DEBUG
+#if DEBUG_NAV
                     Serial.print("NAV_STATUS gpsFix: ");
                     if (c == 0x00) {
                       Serial.println("No fix");
@@ -881,7 +938,8 @@ void loop() {
                       Serial.println("Reserved");
                     }
 #endif
-                    if (c == 0x05) { // Have we got a TIME fix?
+                    // Have we got a TIME fix?
+                    if (c == 0x05) {
 
                     }
                   }
@@ -913,7 +971,8 @@ void loop() {
                 }
               }
               break;
-            // NMEA messages
+
+            // NMEA sentence parsing
             case (PARSE_NMEA_START_CHAR): {
                 ubxLength++; // Increase the message length count
                 if (ubxLength > maxNmeaLength) { // If the length is greater than maxNmeaLength, something bad must have happened (SYNC_LOST)
@@ -1012,9 +1071,6 @@ void loop() {
                   // LF was received so go back to looking for B5 or a $
                   parseStep = PARSE_UBX_SYNC_CHAR_1;
                 }
-#if DEBUG_NMEA
-                Serial.println(); // Insert line break between NMEA sentences in Serial Monitor
-#endif
               }
               break;
           }
@@ -1032,22 +1088,22 @@ void loop() {
           loopStep = CLOSE_FILE; // Close the log file
           break;
         }
-        /*
-          // Check for low battery voltage
-          else if (voltage < lowBattery) {
+        // Check for low battery voltage
+        else if (voltage < lowVoltage) {
           voltageFlag = true;
           loopStep = CLOSE_FILE; // Close the file
           break;
-          }
-        */
+        }
+        // Check if RTC alarm was triggered
         else if ((alarmFlag == true) && (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
-          Serial.println("Alarm triggered! Creating new log file.");
+          Serial.print("RTC alarm: "); printDateTime();
           loopStep = NEW_FILE; // Close the file and open a new one
           break;
         }
+        // Check if sync was lost
         else if (parseStep == SYNC_LOST) {
           Serial.println("Restarting file due to sync loss");
-          loopStep = RESTART_FILE; // Sync has been lost so stop UBX messages and open a new file before restarting RAWX
+          loopStep = RESTART_FILE; // Sync has been lost so halt UBX messages and create a new file before restarting UBX
         }
       }
       break;
@@ -1055,14 +1111,17 @@ void loop() {
     // Close the current log file and open a new one without stopping UBX messages
     case NEW_FILE: {
 
+
         Serial.println("Case: NEW_FILE");
 
         // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
-          resetWatchdog();  // Reset Watchdog Timer
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
+
+          // Blink the LED to indicate SD write
+          blinkLed(1, 50);
 #if DEBUG
           if (numBytes != sdPacket) {
             Serial.print("Warning: Incomplete SD write. ");
@@ -1093,16 +1152,21 @@ void loop() {
 #endif
 
         // An RTC alarm was detected, so set the RTC alarm time to the next alarmInterval and loop back to OPEN_FILE.
-        // We only receive an RTC alarm on a minute mark, so it doesn't matter that the RTC seconds will have moved on at this point.
+        // Set the RTC's alarm
         alarmFlag = false; // Clear the RTC alarm flag
-        //rtc.setAlarmMinutes((rtc.getMinutes() + alarmInterval) % 60); // Correct for hour rollover and set next alarm time (minutes only - hours are ignored)
-
-        rtc.setAlarmTime((rtc.getHours() + alarmInterval) % 24, 0, 0);  // Hours, minutes, seconds
+#if ALARM_MIN
+        // Rolling-minutes alarm
+        rtc.setAlarmTime(0, (rtc.getMinutes() + alarmMinutes) % 60, 0); // Set alarm time(hour, minute, second)
+        rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
+        rtc.enableAlarm(rtc.MATCH_MMSS);                                // Alarm match on minutes and seconds
+#else if ALARM_HR
+        // Rolling-hour alarm
+        rtc.setAlarmTime((rtc.getHours() + alarmHours) % 24, 0, 0);     // Set alarm time (hours, minutes, seconds)
+        rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
         rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
-        rtc.attachInterrupt(alarmMatch);                                // Attach alarm interrupt
-
-        Serial.println("Next alarm: "); printAlarm();
-
+#endif
+        rtc.attachInterrupt(alarmMatch);  // Attach alarm interrupt
+        Serial.print("Next alarm: "); printAlarm();
         loopStep = OPEN_FILE; // Loop to open a new file
         bytesWritten = 0;     // Clear bytesWritten
       }
@@ -1113,7 +1177,7 @@ void loop() {
 
         Serial.println("Case: CLOSE_FILE");
 
-        disableUbx(); // Disable RAWX messages
+        disableUbx(); // Disable UBX messages
         int waitcount = 0;
         // Wait for residual data
         while (waitcount < dwell) {
@@ -1122,13 +1186,12 @@ void loop() {
             bufferPointer++;
             // Write a full packet
             if (bufferPointer == sdPacket) {
-              resetWatchdog();  // Reset Watchdog Timer
               bufferPointer = 0;
               numBytes = file.write(&serBuffer, sdPacket);
               file.sync(); // Sync the file system
               bytesWritten += sdPacket;
 
-              // Blink LED to indicate SD card write
+              // Blink the LED to indicate SD write
               blinkLed(1, 50);
 
 #if DEBUG
@@ -1145,12 +1208,11 @@ void loop() {
         }
         // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
-          resetWatchdog(); // Reset Watchdog Timer
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
 
-          // Blink LED to indicate SD card write
+          // Blink the LED to indicate SD write
           blinkLed(1, 50);
 
 #if DEBUG
@@ -1178,9 +1240,6 @@ void loop() {
         // Close the file
         file.close();
 
-        // Blink LED to indicate SD card write
-        blinkLed(1, 50);
-
 #if DEBUG
         uint32_t filesize = file.fileSize(); // Get the file size
         Serial.print("File size: "); Serial.print(filesize);
@@ -1190,30 +1249,28 @@ void loop() {
 
         // Either the battery is low or the user pressed the stop button:
         if (stopFlag == true) {
-          // Stop switch was pressed so just wait for a reset
-
           Serial.println("Waiting for reset...");
+
           while (1); // Wait for reset
         }
         else {
           // Low battery was detected so wait for the battery to recover
           Serial.println("Battery must be low - waiting for it to recover...");
-
-          // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
-          int high_for = 0;
-          while (high_for < 500) {
-            // read battery voltage
-            voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
-            if (voltage < lowVoltage) {
-              high_for = 0; // If battery voltage is low, reset the count
-            }
-            else {
-              high_for++; // Increase the count
-            }
-            delay(10); // Wait 10 msec
-          }
-
-          // Loop to restart RAWX messages before opening a new file
+          /*
+                    // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
+                    int high_for = 0;
+                    while (high_for < 500) {
+                      voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
+                      if (voltage < lowVoltage) {
+                        high_for = 0; // If battery voltage is low, reset the count
+                      }
+                      else {
+                        high_for++; // Increase the count
+                      }
+                      delay(10); // Wait 10 msec
+                    }
+          */
+          // Loop to restart UBX messages before opening a new file
           digitalWrite(LED_BUILTIN, LOW); // Turn LED off
 
           loopStep = START_UBX;
@@ -1221,11 +1278,13 @@ void loop() {
       }
       break;
 
-    // RAWX data lost sync so disable RAWX messages, save any residual data, close the file, open another and restart RAWX messages
-    // Don't update the next RTC alarm - leave it as it is
+    // If UBX sync is lost, disable UBX messages, save any residual data, close the file, create another and restart UBX messages. Do not update RTC alarm
     case RESTART_FILE: {
 
         Serial.println("RESTART_FILE");
+
+        // Pet the dog
+        resetWatchdog();
 
         // Disable UBX messages
         disableUbx();
@@ -1238,13 +1297,12 @@ void loop() {
             bufferPointer++;
             // Write a full packet
             if (bufferPointer == sdPacket) {
-              resetWatchdog(); // Reset Watchdog Timer
               bufferPointer = 0;
               numBytes = file.write(&serBuffer, sdPacket);
               file.sync(); // Sync the file system
               bytesWritten += sdPacket;
 
-              // Blink LED to indicate SD card write
+              // Blink the LED to indicate SD write
               blinkLed(1, 50);
 #if DEBUG
               if (numBytes != sdPacket) {
@@ -1260,13 +1318,11 @@ void loop() {
         }
         // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
-          resetWatchdog(); // Reset Watchdog Timer
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
 
-          // Blink LED to indicate SD card write
-          blinkLed(1, 50);
+          blinkLed(1, 50);  // Blink LED to indicate SD card write
 
 #if DEBUG
           if (numBytes != sdPacket) {
@@ -1294,9 +1350,6 @@ void loop() {
         // Close the log file
         file.close();
 
-        // Blink LED to indicate SD card write
-        blinkLed(1, 50);
-
 #if DEBUG
         uint32_t filesize = file.fileSize(); // Get the file size
         Serial.print("File size: "); Serial.print(filesize);
@@ -1309,21 +1362,44 @@ void loop() {
 
     case SLEEP: {
 
+#if DEBUG
         Serial.println("Case: SLEEP");
-        // Set alarm
+#endif
+
+        // Pet the dog
+        resetWatchdog();
 
         // Go to deep sleep
-        //LowPower.deepSleep();
+        LowPower.deepSleep();
 
-        loopStep = WAKE;
+        // Check if RTC alarm was triggered
+        if (alarmFlag == true) {
+          loopStep = WAKE;
+        }
+        else {
+          loopStep = SLEEP;
+        }
+
+        // Blink LED to indicate Watchdog Timer trigger
+        blinkLed(1, 10);
+
       } // case SLEEP
       break;
 
     case WAKE: {
 
+#if DEBUG
         Serial.println("Case: WAKE");
+#endif
 
-        loopStep = INIT;
+        // Check battery voltage
+        if (voltage > lowVoltage) {
+          loopStep = INIT;
+        }
+        else {
+          // Set alarm
+          loopStep = SLEEP;
+        }
       } // case WAKE
       break;
   }
@@ -1347,15 +1423,19 @@ void printDateTime() {
 void printAlarm() {
   char alarmBuffer[25];
   snprintf(alarmBuffer, sizeof(alarmBuffer), "%04u-%02d-%02d %02d:%02d:%02d",
-           rtc.getAlarmYear() + 2000, rtc.getAlarmMonth(), rtc.getAlarmDay(),
+           (rtc.getAlarmYear() + 2000), rtc.getAlarmMonth(), rtc.getAlarmDay(),
            rtc.getAlarmHours(), rtc.getAlarmMinutes(), rtc.getAlarmSeconds());
   Serial.println(alarmBuffer);
 }
 
 // Blink LED
 void blinkLed(byte flashes, unsigned long interval) {
+
+  // Pet the dog
+  resetWatchdog();
+
   byte i = 0;
-  while (i < flashes) {
+  while (i < flashes * 2) {
     unsigned long currentMillis = millis();
     if (currentMillis - previousMillis >= interval) {
       previousMillis = currentMillis;
@@ -1365,7 +1445,9 @@ void blinkLed(byte flashes, unsigned long interval) {
       else {
         ledState = LOW;
       }
+#if LED_ON
       digitalWrite(LED_BUILTIN, ledState);
+#endif
       i++;
     }
   }
@@ -1411,10 +1493,15 @@ void resetWatchdog() {
   while (WDT->STATUS.bit.SYNCBUSY);   // Await synchronization of registers between clock domains
 }
 
+// Disable the Watchdog Timer
+void disableWatchdog() {
+  WDT->CTRL.bit.ENABLE = 0;         // Disable Watchdog
+  while (WDT->STATUS.bit.SYNCBUSY); // Await synchronization of registers between clock domains
+}
+
 // Watchdog Timer interrupt service routine
 void WDT_Handler() {
-  if (sleepFlag) {
-    sleepFlag = false;
+  if (watchdogCounter < 10) {
     WDT->INTFLAG.bit.EW = 1;          // Clear the Early Warning interrupt flag //REG_WDT_INTFLAG = WDT_INTFLAG_EW;
     WDT->CLEAR.bit.CLEAR = 0xA5;      // Clear the Watchdog Timer and restart time-out period //REG_WDT_CLEAR = WDT_CLEAR_CLEAR_KEY;
     while (WDT->STATUS.bit.SYNCBUSY); // Await synchronization of registers between clock domains
@@ -1425,6 +1512,11 @@ void WDT_Handler() {
     digitalWrite(LED_BUILTIN, HIGH);  // Turn on LEDs to indicate Watchdog Timer reset has triggered
     digitalWrite(LED_PIN, HIGH);
 #endif
-    while (true);                     // Force Watchdog Timer to reset the system
+    while (1); // Force Watchdog Timer to reset the system
   }
+
+  // Increment the number of watchdog interrupts
+  watchdogCounter++;
+
+  Serial.print("watchdogCounter: "); Serial.println(watchdogCounter);
 }
