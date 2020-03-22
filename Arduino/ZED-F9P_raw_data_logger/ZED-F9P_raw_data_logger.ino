@@ -1,6 +1,6 @@
 /*
   Title:    ZED-F9P Raw Data Logger
-  Date:     March 21, 2020
+  Date:     March 22, 2020
   Author:   Adam Garbo
 
   Description:
@@ -16,8 +16,6 @@
   Comments:
   This code is based heaivly on Paul Clark's F9P_RAWX_Logger:
   https://github.com/PaulZC/ZED-F9P_FeatherWing_USB
-  - Deployed at 2020-03-21 15:40 (19:40 UTC) to test file sizes of ALL data.
-  - Will recover in ~3 hours (21:00 UTC)
 */
 
 // Libraries
@@ -30,9 +28,9 @@
 
 // Debugging definitons
 #define DEBUG               true  // Output debug messages to Serial Monitor
-#define DEBUG_I2C           false // Output I2C debug messages to Serial Monitor
+#define DEBUG_I2C           true  // Output I2C debug messages to Serial Monitor
 #define DEBUG_NAV           false // Output NAV_PVT debug messages to Serial Monitor
-#define DEBUG_SERIAL_BUFFER false // Displays a message each time SerialBuffer.available reaches a new maximum
+#define DEBUG_SERIAL_BUFFER false // Outputs a message each time SerialBuffer.available reaches a new maximum
 #define DEBUG_UBX           false // Output UBX debug messages to Serial Monitor
 
 // LEDs
@@ -40,15 +38,15 @@
 #define LED_PIN 8     // Indicates that the GNSS has established a fix
 
 // Pin assignments
-#define GPS_INT_PIN 5
+#define GPS_INT_PIN 5   // Controls ON/OFF operation of ZED-F9P
 #define MODE_PIN    6   // Connect MODE_PIN to GND to select base mode. Leave open for rover mode.
 #define SURVEY_PIN  A3  // Connect to GND to select SURVEY_IN mode when in BASE mode
 #define SW_PIN      10  // Connect a normally-open push-to-close switch between SW_PIN and GND to halt logging and close the log file
 
 // Select alarm to set
 #define ALARM_MIN false // Enable rolling-minutes alarm
-#define ALARM_HR  true  // Enable rolling-hours alarm
-#define ALARM_DAY false // Enable rolling-day alarm
+#define ALARM_HR  false // Enable rolling-hours alarm
+#define ALARM_DAY true  // Enable rolling-day alarm
 
 // Object instantiations
 RTCZero       rtc;
@@ -58,10 +56,10 @@ SFE_UBLOX_GPS gnss;
 
 // User-declared global variables and constants
 const byte    alarmMinutes    = 10;     // Creates a new log file every alarmMinutes
-const byte    alarmHours      = 1;      // Creates a new log file every alarmHours
+const byte    alarmHours      = 4;      // Creates a new log file every alarmHours
 const int     maxValFix       = 10;     // Minimum number of valid GNSS fixes to collect before beginning to log data
 const int     dwell           = 1100;   // How long to wait in msec for residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
-const float   lowVoltage      = 3.5;   // Low battery voltage threshold
+const float   lowVoltage      = 3.5;    // Low battery voltage threshold
 
 // Global flag variable delcarations
 volatile bool alarmFlag       = false;  // RTC alarm interrupt service routine flag
@@ -489,8 +487,8 @@ void setup() {
   // Initialize the u-blox ZED-F9P
   if (gnss.begin() == true) {
     Serial.println("u-blox ZED-F9P initialized.");
-    //gnss.sendCommand(ubxCfgPm2);  // Configure UBX-CFG-PM2 for ON/OFF operation
-    //gnss.saveConfiguration();     // Save current settings to flash and BBR
+    gnss.sendCommand(ubxCfgPm2);  // Configure UBX-CFG-PM2 for ON/OFF operation
+    gnss.saveConfiguration();     // Save current settings to flash and BBR
 #if DEBUG_I2C
     gnss.enableDebugging();       // Enable I2C debug output to Serial Monitor
 #endif
@@ -509,10 +507,10 @@ void setup() {
   // Payload:           UBX-CFG-VALSET (0x06 0x8A)
 
   // These sendCommands will timeout as the commandAck checking in processUBXpacket expects the packet to be in packetCfg, not our custom packet!
-  // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:5 ID:1 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
+  // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:ACK ID:1 Len: 0x2 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
   boolean setValueSuccess = true;
 
-  setValueSuccess &= configureGnss();       // Configure GNSS constellations
+  //setValueSuccess &= configureGnss();       // Configure GNSS constellations
   setValueSuccess &= disableI2cNmea();      // Disable NMEA messages on the I2C port leaving it clear for UBX messages
   setValueSuccess &= setUart1Baud();        // Change the UART1 baud rate to 230400
   setValueSuccess &= disableUbx();          // Disable UBX messages and NMEA high precision mode on UART1
@@ -543,14 +541,14 @@ void setup() {
     modeFlag = false; // Clear modeFlag flag
     Serial.println("ROVER mode selected");
     // Select one mode for the mobile Rover Logger
-    setNavPortable(); // Set Portable Navigation Mode
+    //setNavPortable();   // Set Portable Navigation Mode
     //setNavPedestrian(); // Set Pedestrian Navigation Mode
     //setNavAutomotive(); // Set Automotive Navigation Mode
-    //setNavSea(); // Set Sea Navigation Mode
-    //setNavAir1g(); // Set Airborne <1G Navigation Mode
-    //setNavAir2g(); // Set Airborne <2G Navigation Mode
-    //setNavAir4g(); // Set Airborne <4G Navigation Mode
-    //setNavWrist(); // Set Wrist Navigation Mode
+    //setNavSea();        // Set Sea Navigation Mode
+    //setNavAir1g();      // Set Airborne <1G Navigation Mode
+    //setNavAir2g();      // Set Airborne <2G Navigation Mode
+    //setNavAir4g();      // Set Airborne <4G Navigation Mode
+    //setNavWrist();      // Set Wrist Navigation Mode
   }
 
 #if !LED_ON
@@ -560,11 +558,13 @@ void setup() {
   // Start Serial1 at 230400 baud
   Serial1.begin(230400);
 
+#if DEBUG
   // Print RTC's current date and time
   Serial.print("Current RTC date and time: "); printDateTime();
 
   // Wait for GNSS fix
   Serial.println("Awaiting GNSS fix...");
+#endif
 }
 
 // Loop
@@ -630,12 +630,19 @@ void loop() {
           alarmFlag = false; // Clear alarm flag
 #if ALARM_MIN
           // Rolling-minutes alarm
-          rtc.setAlarmTime(0, (rtc.getMinutes() + alarmMinutes) % 60, 0); // Set alarm time (hour, minute, second)
+          rtc.setAlarmTime(0, (rtc.getMinutes() + alarmMinutes) % 60, 0); // Set alarm time(hour, minute, second)
           rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
           rtc.enableAlarm(rtc.MATCH_MMSS);                                // Alarm match on minutes and seconds
-#else if ALARM_HR
+#endif
+#if ALARM_HR
           // Rolling-hour alarm
           rtc.setAlarmTime((rtc.getHours() + alarmHours) % 24, 0, 0);     // Set alarm time (hours, minutes, seconds)
+          rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
+          rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
+#endif
+#if ALARM_DAY
+          // Rolling-day alarm
+          rtc.setAlarmTime(0, 0, 0);                                      // Set alarm time (hours, minutes, seconds)
           rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
           rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
 #endif
@@ -691,9 +698,9 @@ void loop() {
 
     // Open the log file
     case OPEN_FILE: {
-
+#if DEBUG
         Serial.println("Case: OPEN_FILE");
-
+#endif
         // Pet the dog
         resetWatchdog();
 
@@ -1085,13 +1092,13 @@ void loop() {
         // Check if stop button was pressed
         if (digitalRead(SW_PIN) == LOW) {
           stopFlag = true;
-          loopStep = CLOSE_FILE; // Close the log file
+          //loopStep = CLOSE_FILE; // Close the log file
           break;
         }
         // Check for low battery voltage
         else if (voltage < lowVoltage) {
           voltageFlag = true;
-          loopStep = CLOSE_FILE; // Close the file
+          //loopStep = CLOSE_FILE; // Close the file
           break;
         }
         // Check if RTC alarm was triggered
@@ -1110,10 +1117,9 @@ void loop() {
 
     // Close the current log file and open a new one without stopping UBX messages
     case NEW_FILE: {
-
-
+#if DEBUG
         Serial.println("Case: NEW_FILE");
-
+#endif
         // If there is any data left in serBuffer, write it to file
         if (bufferPointer > 0) {
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
@@ -1143,11 +1149,11 @@ void loop() {
 
         // Close the file
         file.close();
-        Serial.println("File closed!");
 
 #if DEBUG
+        Serial.print("File closed!");
         uint32_t filesize = file.fileSize(); // Get the file size
-        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
 
@@ -1159,14 +1165,24 @@ void loop() {
         rtc.setAlarmTime(0, (rtc.getMinutes() + alarmMinutes) % 60, 0); // Set alarm time(hour, minute, second)
         rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
         rtc.enableAlarm(rtc.MATCH_MMSS);                                // Alarm match on minutes and seconds
-#else if ALARM_HR
+#endif
+#if ALARM_HR
         // Rolling-hour alarm
         rtc.setAlarmTime((rtc.getHours() + alarmHours) % 24, 0, 0);     // Set alarm time (hours, minutes, seconds)
         rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
         rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
 #endif
-        rtc.attachInterrupt(alarmMatch);  // Attach alarm interrupt
+#if ALARM_DAY
+        // Rolling-day alarm
+        rtc.setAlarmTime(0, 0, 0);                                      // Set alarm time (hours, minutes, seconds)
+        rtc.setAlarmDate(rtc.getDay(), rtc.getMonth(), rtc.getYear());  // Set alarm date (day, month, year)
+        rtc.enableAlarm(rtc.MATCH_HHMMSS);                              // Alarm match on hours, minutes and seconds
+#endif
+        rtc.attachInterrupt(alarmMatch); // Attach alarm interrupt
+#if DEBUG
         Serial.print("Next alarm: "); printAlarm();
+#endif
+
         loopStep = OPEN_FILE; // Loop to open a new file
         bytesWritten = 0;     // Clear bytesWritten
       }
@@ -1174,9 +1190,9 @@ void loop() {
 
     // Disable UBX messages, save any residual data and close the file
     case CLOSE_FILE: {
-
+#if DEBUG
         Serial.println("Case: CLOSE_FILE");
-
+#endif
         disableUbx(); // Disable UBX messages
         int waitcount = 0;
         // Wait for residual data
@@ -1241,38 +1257,36 @@ void loop() {
         file.close();
 
 #if DEBUG
+        Serial.print("File closed!");
         uint32_t filesize = file.fileSize(); // Get the file size
-        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
-        Serial.println("File closed!");
 
         // Either the battery is low or the user pressed the stop button:
         if (stopFlag == true) {
           Serial.println("Waiting for reset...");
 
-          while (1); // Wait for reset
+          //while (1); // Wait for reset
         }
         else {
           // Low battery was detected so wait for the battery to recover
           Serial.println("Battery must be low - waiting for it to recover...");
           /*
-                    // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
-                    int high_for = 0;
-                    while (high_for < 500) {
-                      voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
-                      if (voltage < lowVoltage) {
-                        high_for = 0; // If battery voltage is low, reset the count
-                      }
-                      else {
-                        high_for++; // Increase the count
-                      }
-                      delay(10); // Wait 10 msec
-                    }
+            // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
+            int high_for = 0;
+            while (high_for < 500) {
+            voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
+            if (voltage < lowVoltage) {
+            high_for = 0; // If battery voltage is low, reset the count
+            }
+            else {
+            high_for++; // Increase the count
+            }
+            delay(10); // Wait 10 msec
+            }
           */
           // Loop to restart UBX messages before opening a new file
-          digitalWrite(LED_BUILTIN, LOW); // Turn LED off
-
           loopStep = START_UBX;
         }
       }
@@ -1333,7 +1347,6 @@ void loop() {
           Serial.print("Final SD write: "); Serial.print(bufferPointer);
           Serial.print(" bytes. Total bytes written: "); Serial.println(bytesWritten);
 #endif
-
           // Reset bufferPointer
           bufferPointer = 0;
         }
@@ -1347,16 +1360,17 @@ void loop() {
           Serial.println("Warning: Unable to set file access timestamp!");
         }
 
-        // Close the log file
+        // Close the file
         file.close();
 
 #if DEBUG
+        Serial.print("File closed!");
         uint32_t filesize = file.fileSize(); // Get the file size
-        Serial.print("File size: "); Serial.print(filesize);
+        Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
-        Serial.println("File closed!");
-        loopStep = START_UBX; // Loop to restart UBX messages before opening a new file
+        // Loop to restart UBX messages before opening a new file
+        loopStep = START_UBX;
       } // case RESTART_FILE
       break;
 
@@ -1491,6 +1505,7 @@ void configureWatchdog() {
 void resetWatchdog() {
   WDT->CLEAR.bit.CLEAR = 0xA5;        // Clear the Watchdog Timer and restart time-out period //REG_WDT_CLEAR = WDT_CLEAR_CLEAR_KEY;
   while (WDT->STATUS.bit.SYNCBUSY);   // Await synchronization of registers between clock domains
+  watchdogCounter = 0;
 }
 
 // Disable the Watchdog Timer
@@ -1501,6 +1516,7 @@ void disableWatchdog() {
 
 // Watchdog Timer interrupt service routine
 void WDT_Handler() {
+  // Permit a limited number of Watchdog Timer interrupts before resetting the system
   if (watchdogCounter < 10) {
     WDT->INTFLAG.bit.EW = 1;          // Clear the Early Warning interrupt flag //REG_WDT_INTFLAG = WDT_INTFLAG_EW;
     WDT->CLEAR.bit.CLEAR = 0xA5;      // Clear the Watchdog Timer and restart time-out period //REG_WDT_CLEAR = WDT_CLEAR_CLEAR_KEY;
@@ -1517,6 +1533,7 @@ void WDT_Handler() {
 
   // Increment the number of watchdog interrupts
   watchdogCounter++;
-
+#if DEBUG
   Serial.print("watchdogCounter: "); Serial.println(watchdogCounter);
+#endif
 }
