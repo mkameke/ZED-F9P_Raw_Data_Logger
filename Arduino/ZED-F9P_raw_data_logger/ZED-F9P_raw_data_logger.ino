@@ -27,8 +27,8 @@
 #include <Wire.h>                           // https://www.arduino.cc/en/Reference/Wire
 
 // Debugging definitons
-#define DEBUG               true  // Output debug messages to Serial Monitor
-#define DEBUG_I2C           true  // Output I2C debug messages to Serial Monitor
+#define DEBUG               true // Output debug messages to Serial Monitor
+#define DEBUG_I2C           false // Output I2C debug messages to Serial Monitor
 #define DEBUG_NAV           false // Output NAV_PVT debug messages to Serial Monitor
 #define DEBUG_SERIAL_BUFFER false // Outputs a message each time SerialBuffer.available reaches a new maximum
 #define DEBUG_UBX           false // Output UBX debug messages to Serial Monitor
@@ -38,7 +38,7 @@
 #define LED_PIN 8     // Indicates that the GNSS has established a fix
 
 // Pin assignments
-#define GPS_INT_PIN 5   // Controls ON/OFF operation of ZED-F9P
+#define GPS_INT_PIN A3  // Controls ON/OFF operation of ZED-F9P
 #define MODE_PIN    6   // Connect MODE_PIN to GND to select base mode. Leave open for rover mode.
 #define SURVEY_PIN  A3  // Connect to GND to select SURVEY_IN mode when in BASE mode
 #define SW_PIN      10  // Connect a normally-open push-to-close switch between SW_PIN and GND to halt logging and close the log file
@@ -437,7 +437,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(MODE_PIN, INPUT_PULLUP);    // Input for the Base/Rover mode select switch
-  pinMode(GPS_INT_PIN, OUTPUT);       //
+  pinMode(GPS_INT_PIN, OUTPUT);       // Control ZED-F9P ON/OFF operation
   pinMode(SW_PIN, INPUT_PULLUP);      // Input for the stop switch
   pinMode(SURVEY_PIN, INPUT_PULLUP);  // Input for the SURVEY_IN switch
 
@@ -487,8 +487,8 @@ void setup() {
   // Initialize the u-blox ZED-F9P
   if (gnss.begin() == true) {
     Serial.println("u-blox ZED-F9P initialized.");
-    gnss.sendCommand(ubxCfgPm2);  // Configure UBX-CFG-PM2 for ON/OFF operation
-    gnss.saveConfiguration();     // Save current settings to flash and BBR
+    //gnss.sendCommand(ubxCfgPm2);  // Configure UBX-CFG-PM2 for ON/OFF operation
+    //gnss.saveConfiguration();     // Save current settings to flash and BBR
 #if DEBUG_I2C
     gnss.enableDebugging();       // Enable I2C debug output to Serial Monitor
 #endif
@@ -510,7 +510,7 @@ void setup() {
   // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:ACK ID:1 Len: 0x2 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
   boolean setValueSuccess = true;
 
-  //setValueSuccess &= configureGnss();       // Configure GNSS constellations
+  setValueSuccess &= configureGnss();       // Configure GNSS constellations
   setValueSuccess &= disableI2cNmea();      // Disable NMEA messages on the I2C port leaving it clear for UBX messages
   setValueSuccess &= setUart1Baud();        // Change the UART1 baud rate to 230400
   setValueSuccess &= disableUbx();          // Disable UBX messages and NMEA high precision mode on UART1
@@ -540,7 +540,7 @@ void setup() {
   else {
     modeFlag = false; // Clear modeFlag flag
     Serial.println("ROVER mode selected");
-    // Select one mode for the mobile Rover Logger
+    // Select rover mode
     //setNavPortable();   // Set Portable Navigation Mode
     //setNavPedestrian(); // Set Pedestrian Navigation Mode
     //setNavAutomotive(); // Set Automotive Navigation Mode
@@ -655,20 +655,20 @@ void loop() {
             loopStep = SLEEP;
             break;
           }
-
-          // If we are in BASE mode, check the SURVEY_IN pin
-          if (modeFlag == true) {
-            if (digitalRead(SURVEY_PIN) == LOW) {
-              // We are in BASE mode and the SURVEY_IN pin is low so send the extra UBX messages:
-              Serial.println("SURVEY_IN mode selected");
-              surveyFlag = true;  // Set the surveyFlag flag true
-              enableRtcm();       // Enable RTCM messages on UART2
-              delay(1100);
-              setSurveyIn();      // Enable SURVEY_IN mode
-              delay(1100);
+          /*
+            // If we are in BASE mode, check the SURVEY_IN pin
+            if (modeFlag == true) {
+              if (digitalRead(SURVEY_PIN) == LOW) {
+                // We are in BASE mode and the SURVEY_IN pin is low so send the extra UBX messages:
+                Serial.println("SURVEY_IN mode selected");
+                surveyFlag = true;  // Set the surveyFlag flag true
+                enableRtcm();       // Enable RTCM messages on UART2
+                delay(1100);
+                setSurveyIn();      // Enable SURVEY_IN mode
+                delay(1100);
+              }
             }
-          }
-
+          */
           // Flush RX buffer to clear any old data
           while (Serial1.available()) {
             Serial1.read();
@@ -1088,21 +1088,22 @@ void loop() {
         }
 
         // Check for conditions that would halt logging
-
-        // Check if stop button was pressed
-        if (digitalRead(SW_PIN) == LOW) {
-          stopFlag = true;
-          //loopStep = CLOSE_FILE; // Close the log file
-          break;
-        }
-        // Check for low battery voltage
-        else if (voltage < lowVoltage) {
-          voltageFlag = true;
-          //loopStep = CLOSE_FILE; // Close the file
-          break;
-        }
+        /*
+          // Check if stop button was pressed
+          if (digitalRead(SW_PIN) == LOW) {
+            stopFlag = true;
+            loopStep = CLOSE_FILE; // Close the log file
+            break;
+          }
+          // Check for low battery voltage
+          else if (voltage < lowVoltage) {
+            voltageFlag = true;
+            loopStep = CLOSE_FILE; // Close the file
+            break;
+          }
+        */
         // Check if RTC alarm was triggered
-        else if ((alarmFlag == true) && (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
+        if ((alarmFlag == true) && (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
           Serial.print("RTC alarm: "); printDateTime();
           loopStep = NEW_FILE; // Close the file and open a new one
           break;
@@ -1156,6 +1157,15 @@ void loop() {
         Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
+
+
+        // Synchronize the RTC with GPS time
+        if (gnss.getFixType() > 0) {
+          // Set the RTC's date and time
+          rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond());    // Set the time
+          rtc.setDate(gnss.getDay(), gnss.getMonth(), gnss.getYear() - 2000); // Set the date
+          Serial.print("RTC set: "); printDateTime();
+        }
 
         // An RTC alarm was detected, so set the RTC alarm time to the next alarmInterval and loop back to OPEN_FILE.
         // Set the RTC's alarm
@@ -1262,33 +1272,32 @@ void loop() {
         Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
+        /*
+          // Either the battery is low or the user pressed the stop button:
+          if (stopFlag == true) {
+            Serial.println("Waiting for reset...");
+            while (1); // Wait for reset
+          }
+          else {
+            // Low battery was detected so wait for the battery to recover
+            Serial.println("Battery must be low - waiting for it to recover...");
 
-        // Either the battery is low or the user pressed the stop button:
-        if (stopFlag == true) {
-          Serial.println("Waiting for reset...");
-
-          //while (1); // Wait for reset
-        }
-        else {
-          // Low battery was detected so wait for the battery to recover
-          Serial.println("Battery must be low - waiting for it to recover...");
-          /*
             // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
-            int high_for = 0;
-            while (high_for < 500) {
-            voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
-            if (voltage < lowVoltage) {
-            high_for = 0; // If battery voltage is low, reset the count
+            int voltageTimer = 0;
+            while (voltageTimer < 500) {
+              voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
+              if (voltage < lowVoltage) {
+                voltageTimer = 0; // If battery voltage is low, reset the count
+              }
+              else {
+                voltageTimer++; // Increase the count
+              }
+              delay(10); // Wait 10 msec
             }
-            else {
-            high_for++; // Increase the count
-            }
-            delay(10); // Wait 10 msec
-            }
-          */
-          // Loop to restart UBX messages before opening a new file
-          loopStep = START_UBX;
-        }
+          }
+        */
+        // Loop to restart UBX messages before opening a new file
+        loopStep = START_UBX;
       }
       break;
 
