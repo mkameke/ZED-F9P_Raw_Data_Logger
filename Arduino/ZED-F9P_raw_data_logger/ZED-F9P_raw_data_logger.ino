@@ -38,7 +38,6 @@
 #define LED_PIN 8     // Indicates that the GNSS has established a fix
 
 // Pin assignments
-#define GPS_INT_PIN A3  // Controls ON/OFF operation of ZED-F9P
 #define MODE_PIN    6   // Connect MODE_PIN to GND to select base mode. Leave open for rover mode.
 #define SURVEY_PIN  A3  // Connect to GND to select SURVEY_IN mode when in BASE mode
 #define SW_PIN      10  // Connect a normally-open push-to-close switch between SW_PIN and GND to halt logging and close the log file
@@ -437,7 +436,6 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(MODE_PIN, INPUT_PULLUP);    // Input for the Base/Rover mode select switch
-  pinMode(GPS_INT_PIN, OUTPUT);       // Control ZED-F9P ON/OFF operation
   pinMode(SW_PIN, INPUT_PULLUP);      // Input for the stop switch
   pinMode(SURVEY_PIN, INPUT_PULLUP);  // Input for the SURVEY_IN switch
 
