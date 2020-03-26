@@ -4,7 +4,7 @@
   Author:   Adam Garbo
 
   Description:
-  - Logs u-blox ZED-F9P UBX-RXM-RAWX and UBX-RXM-SFRBX data SD card
+  - Logs UBX-RXM-RAWX and UBX-RXM-SFRBX data from u-blox ZED-F9P GNSS receiver to SD card
 
   Components:
   - Adafruit Feather M0 Adalogger
@@ -13,6 +13,7 @@
   Comments:
   - This code is based on Paul Clark's F9P_RAWX_Logger:
   https://github.com/PaulZC/ZED-F9P_FeatherWing_USB
+  - Added functionality includes rolling alarms and Watchdog Timer
 */
 
 // Libraries
@@ -309,17 +310,16 @@ void setup() {
 
   // Initialize the u-blox ZED-F9P
   if (gnss.begin() == false) {
+    Serial.println("u-blox ZED-F9P initialized.");
+#if DEBUG_I2C
+    gnss.enableDebugging(); // Enable I2C debugging output to Serial Monitor
+#endif
+  }
+  else {
     Serial.println("Warning: u-blox ZED-F9P not detected at default I2C address. Please check wiring. Halting!");
     digitalWrite(LED_BUILTIN, HIGH);
     digitalWrite(LED_PIN, HIGH);
     while (1); // Halt the program
-
-  }
-  else {
-    Serial.println("u-blox ZED-F9P initialized.");
-#if DEBUG_I2C
-    gnss.enableDebugging();       // Enable I2C debug output to Serial Monitor
-#endif
   }
 
   // Configure u-blox ZED-F9P
@@ -339,7 +339,7 @@ void setup() {
   setValueSuccess &= disableUbx();        // Disable UBX messages
   setValueSuccess &= setNavStationary();  // Set Static Navigation Mode
   setValueSuccess &= configureGnss();     // Configure GNSS constellations
-  //setNavPortable();   // Set Portable Navigation Mode
+  //setValueSuccess &= setNavPortable();    // Set Portable Navigation Mode
 
   if (setValueSuccess == true) {
     Serial.println("u-blox ZED-F9P configured.");
@@ -382,11 +382,11 @@ void loop() {
                  gnss.getYear(), gnss.getMonth(), gnss.getDay(),
                  gnss.getHour(), gnss.getMinute(), gnss.getSecond());
 
-        int32_t latitude = gnss.getLatitude();
-        int32_t longitude = gnss.getLongitude();
-        uint16_t pdop = gnss.getPDOP();
-        uint8_t fix = gnss.getFixType();
-        uint8_t satellites = gnss.getSIV();
+        long latitude = gnss.getLatitude();
+        long longitude = gnss.getLongitude();
+        unsigned int pdop = gnss.getPDOP();
+        byte fix = gnss.getFixType();
+        byte satellites = gnss.getSIV();
 
         Serial.print(gnssDateTime);
         Serial.print(" Latitude: "); Serial.print(latitude);
@@ -397,20 +397,14 @@ void loop() {
 #endif
 
         // Read battery voltage
-        voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
-#if DEBUG
-        //Serial.print("Battery: "); Serial.print(voltage, 2); Serial.println("V");
-#endif
+        readBattery();
 
         // Has a GNSS fix been acquired?
         if (gnss.getFixType() > 0) {
 #if LED_ON
           digitalWrite(LED_PIN, HIGH); // Turn LED ON to indicate GNSS fix
 #endif
-          // Increment valFix and cap at maxValFix
-          // don't do anything fancy in terms of decrementing valFix as we want to keep logging even if the fix is lost
-          valFix += 1;
-          if (valFix > maxValFix) valFix = maxValFix;
+          valFix++; // Increment counter
         }
         else {
 #if LED_ON
@@ -420,6 +414,8 @@ void loop() {
 
         // Have enough valid GNSS fixes been collected?
         if (valFix == maxValFix) {
+
+          valFix = 0; // Reset counter
 
           // Set the RTC's date and time
           rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond());    // Set the time
@@ -449,22 +445,23 @@ void loop() {
           rtc.attachInterrupt(alarmMatch);  // Attach alarm interrupt
           Serial.print("Next alarm: "); printAlarm();
 
-          // Halt logging if battery voltage is below lowVoltage threshold
+          // Check if battery voltage is below lowVoltage threshold
           if (voltage < lowVoltage) {
             Serial.println("Warning: Low battery!");
             loopStep = SLEEP;
             break;
           }
+
           // Flush RX buffer to clear any old data
           while (Serial1.available()) {
             Serial1.read();
           }
 
-          // Now that Serial1 should be idle and the buffer empty, start TC3 interrupts to copy all new data into SerialBuffer
+          // Once Serial1 is idle and the buffer is empty, start TC3 interrupts to copy all new data into SerialBuffer
           // Set the timer interval to 10 * 10 / 230400 = 0.000434 secs (10 bytes * 10 bits (1 start, 8 data, 1 stop) at 230400 baud)
           startTimerInterval(0.000434);
 
-          // Start UBX data
+          // Start UBX messages
           loopStep = START_UBX;
         }
       }
@@ -478,7 +475,7 @@ void loop() {
         // Start UBX messages
         enableUbx();
 
-        // Initialise bufferPointer
+        // Initialize bufferPointer
         bufferPointer = 0;
 
         // Create a new log file
@@ -543,29 +540,23 @@ void loop() {
             Serial.println(maxSerialBuffer);
           }
 #endif
-          // Read bytes on Serial1 (UART1)
+          // Read bytes on Serial1
           uint8_t c = SerialBuffer.read_char();
 
           // Write bytes to serBuffer
           serBuffer[bufferPointer] = c;
 
 #if DEBUG_UBX
-          // Output UBX hex data to Serial Monitor
-          //char dataString[2] = {0};
-          //sprintf(dataString, "%02X ", c);
-          //Serial.print(dataString);
-
+          // Echo UBX hex data to Serial Monitor
           Serial.printf("%02X ", c);
 #endif
           bufferPointer++;
           if (bufferPointer == sdPacket) {
             bufferPointer = 0;
-            numBytes = file.write(&serBuffer, sdPacket);
+            numBytes = file.write(&serBuffer, sdPacket); // Write a full packet
             file.sync(); // Sync the file system
             bytesWritten += sdPacket;
-
-            // Blink the LED to indicate SD write
-            blinkLed(1, 50);
+            blinkLed(1, 50); // Blink LED to indicate SD write
 #if DEBUG
             if (numBytes != sdPacket) {
               Serial.print("Warning: SD write error. Only ");
@@ -592,23 +583,23 @@ void loop() {
           // has returned to "PARSE_UBX_SYNC_CHAR_1" or when a data error is detected (i.e. SYNC_LOST)
           switch (parseStep) {
             case (PARSE_UBX_SYNC_CHAR_1): {
-                if (c == 0xB5) { // Have we found Sync Char 1 (0xB5) if we were expecting one?
-                  parseStep = PARSE_UBX_SYNC_CHAR_2; // Now look for Sync Char 2 (0x62)
+                if (c == 0xB5) {
+                  parseStep = PARSE_UBX_SYNC_CHAR_2; // Look for Sync Char 2 (0x62)
                 }
                 else {
-                  Serial.println("Warning: Was expecting Sync Char 0xB5 but did not receive one!");
+                  Serial.println("Warning: Did not receive Sync Char 1 (0xB5)!");
                   parseStep = SYNC_LOST;
                 }
               }
               break;
             case (PARSE_UBX_SYNC_CHAR_2): {
-                if (c == 0x62) { // Have we found Sync Char 2 (0x62) when we were expecting one?
-                  ubxExpectedChecksumA = 0; // Reset the expected checksum
+                if (c == 0x62) {
+                  ubxExpectedChecksumA = 0; // Reset expected checksum
                   ubxExpectedChecksumB = 0;
-                  parseStep = PARSE_UBX_CLASS; // Now look for Class byte
+                  parseStep = PARSE_UBX_CLASS; // Look for Class
                 }
                 else {
-                  Serial.println("Warning: Was expecting Sync Char 0x62 but did not receive one!");
+                  Serial.println("Warning: Did not receive Sync Char 2 (0x62)!");
                   parseStep = SYNC_LOST;
                 }
               }
@@ -620,11 +611,11 @@ void loop() {
                 ubxClass = c;
                 ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_ID; // Now look for ID byte
+                parseStep = PARSE_UBX_ID; // Look for ID
 
                 // Class syntax checking
                 if (ubxClass != 0x02) {
-                  Serial.println("Warning: Was expecting Class of 0x02 but did not receive one!");
+                  Serial.println("Warning: Did not receive Class 0x02!");
                   parseStep = SYNC_LOST;
                 }
               }
@@ -633,27 +624,27 @@ void loop() {
                 ubxId = c;
                 ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_LENGTH_LSB; // Now look for length LSB
+                parseStep = PARSE_UBX_LENGTH_LSB; // Look for length LSB
 
                 // ID syntax checking
                 if ((ubxId != 0x15) && (ubxId != 0x13)) {
-                  Serial.println("Warning: Was expecting ID of 0x15 or 0x13 but did not receive one!");
+                  Serial.println("Warning: Did not receive ID 0x15 or 0x13!");
                   parseStep = SYNC_LOST;
                 }
               }
               break;
             case (PARSE_UBX_LENGTH_LSB): {
-                ubxLength = c; // Store the length LSB
+                ubxLength = c; // Store length LSB
                 ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_LENGTH_MSB; // Now look for length MSB
+                parseStep = PARSE_UBX_LENGTH_MSB; // Look for length MSB
               }
               break;
             case (PARSE_UBX_LENGTH_MSB): {
-                ubxLength = ubxLength + (c * 256); // Add the length MSB
+                ubxLength = ubxLength + (c * 256); // Add length MSB
                 ubxExpectedChecksumA = ubxExpectedChecksumA + c; // Update the expected checksum
                 ubxExpectedChecksumB = ubxExpectedChecksumB + ubxExpectedChecksumA;
-                parseStep = PARSE_UBX_PAYLOAD; // Now look for payload bytes (length: ubxLength)
+                parseStep = PARSE_UBX_PAYLOAD; // Look for payload bytes (length: ubxLength)
               }
               break;
             case (PARSE_UBX_PAYLOAD): {
@@ -688,25 +679,9 @@ void loop() {
           }
         }
         else {
-          // Read battery voltage
-          voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0);
+          readBattery(); // Read battery voltage
         }
 
-        // Check for conditions that would halt logging
-        /*
-          // Check if stop button was pressed
-          if (digitalRead(SW_PIN) == LOW) {
-            stopFlag = true;
-            loopStep = CLOSE_FILE; // Close the log file
-            break;
-          }
-          // Check for low battery voltage
-          else if (voltage < lowVoltage) {
-            voltageFlag = true;
-            loopStep = CLOSE_FILE; // Close the file
-            break;
-          }
-        */
         // Check if RTC alarm was triggered
         if ((alarmFlag == true) && (parseStep == PARSE_UBX_SYNC_CHAR_1)) {
           Serial.print("RTC alarm: "); printDateTime();
@@ -715,8 +690,14 @@ void loop() {
         }
         // Check if sync was lost
         else if (parseStep == SYNC_LOST) {
-          Serial.println("Restarting file due to sync loss");
-          loopStep = RESTART_FILE; // Sync has been lost so halt UBX messages and create a new file before restarting UBX
+          Serial.println("Warning: Sync lost! Restarting file...");
+          loopStep = RESTART_FILE; // Disable UBX messages, create new log file and reenable UBX messages
+        }
+        // Check for low battery voltage
+        else if (voltage < lowVoltage) {
+          voltageFlag = true;
+          loopStep = CLOSE_FILE; // Close the file
+          break;
         }
       }
       break;
@@ -726,14 +707,12 @@ void loop() {
 #if DEBUG
         Serial.println("Case: NEW_FILE");
 #endif
-        // If there is any data left in serBuffer, write it to file
+        // Write any remaining data in serBuffer to file
         if (bufferPointer > 0) {
-          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
+          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data to file
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
-
-          // Blink the LED to indicate SD write
-          blinkLed(1, 50);
+          blinkLed(1, 50); // Blink LED to indicate SD write
 #if DEBUG
           if (numBytes != sdPacket) {
             Serial.print("Warning: Incomplete SD write. ");
@@ -758,12 +737,10 @@ void loop() {
 
 #if DEBUG
         Serial.print("File closed!");
-        uint32_t filesize = file.fileSize(); // Get the file size
+        unsigned long filesize = file.fileSize(); // Get the file size
         Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
-
-
         // Synchronize the RTC with GPS time
         if (gnss.getFixType() > 0) {
           // Set the RTC's date and time
@@ -813,18 +790,14 @@ void loop() {
         // Wait for residual data
         while (waitcount < dwell) {
           while (SerialBuffer.available()) {
-            serBuffer[bufferPointer] = SerialBuffer.read_char(); // Put extra bytes into serBuffer
+            serBuffer[bufferPointer] = SerialBuffer.read_char(); // Place extra bytes in serBuffer
             bufferPointer++;
-            // Write a full packet
             if (bufferPointer == sdPacket) {
               bufferPointer = 0;
-              numBytes = file.write(&serBuffer, sdPacket);
+              numBytes = file.write(&serBuffer, sdPacket); // Write a full packet
               file.sync(); // Sync the file system
               bytesWritten += sdPacket;
-
-              // Blink the LED to indicate SD write
-              blinkLed(1, 50);
-
+              blinkLed(1, 50); // Blink LED to indicate SD write
 #if DEBUG
               if (numBytes != sdPacket) {
                 Serial.print("Warning: SD write error. Only ");
@@ -837,14 +810,12 @@ void loop() {
           waitcount++;
           delay(1);
         }
-        // If there is any data left in serBuffer, write it to file
+        // Write any remaining data in serBuffer to file
         if (bufferPointer > 0) {
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
-
-          // Blink the LED to indicate SD write
-          blinkLed(1, 50);
+          blinkLed(1, 50); // Blink LED to indicate SD write
 
 #if DEBUG
           if (numBytes != sdPacket) {
@@ -873,34 +844,11 @@ void loop() {
 
 #if DEBUG
         Serial.print("File closed!");
-        uint32_t filesize = file.fileSize(); // Get the file size
+        unsigned long filesize = file.fileSize(); // Get the file size
         Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
-        /*
-          // Either the battery is low or the user pressed the stop button:
-          if (stopFlag == true) {
-            Serial.println("Waiting for reset...");
-            while (1); // Wait for reset
-          }
-          else {
-            // Low battery was detected so wait for the battery to recover
-            Serial.println("Battery must be low - waiting for it to recover...");
 
-            // Check the battery voltage. Make sure it has been OK for at least 5 seconds before continuing
-            int voltageTimer = 0;
-            while (voltageTimer < 500) {
-              voltage = analogRead(A7) * (2.0 * 3.3 / 1023.0); // Read battery voltage
-              if (voltage < lowVoltage) {
-                voltageTimer = 0; // If battery voltage is low, reset the count
-              }
-              else {
-                voltageTimer++; // Increase the count
-              }
-              delay(10); // Wait 10 msec
-            }
-          }
-        */
         // Loop to restart UBX messages before opening a new file
         loopStep = START_UBX;
       }
@@ -908,9 +856,9 @@ void loop() {
 
     // If UBX sync is lost, disable UBX messages, save any residual data, close the file, create another and restart UBX messages. Do not update RTC alarm
     case RESTART_FILE: {
-
+#if DEBUG
         Serial.println("RESTART_FILE");
-
+#endif
         // Pet the dog
         resetWatchdog();
 
@@ -929,9 +877,7 @@ void loop() {
               numBytes = file.write(&serBuffer, sdPacket);
               file.sync(); // Sync the file system
               bytesWritten += sdPacket;
-
-              // Blink the LED to indicate SD write
-              blinkLed(1, 50);
+              blinkLed(1, 50); // Blink LED to indicate SD write
 #if DEBUG
               if (numBytes != sdPacket) {
                 Serial.print("Warning: Incomplete SD write. ");
@@ -949,9 +895,7 @@ void loop() {
           numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
-
-          blinkLed(1, 50);  // Blink LED to indicate SD card write
-
+          blinkLed(1, 50); // Blink LED to indicate SD card write
 #if DEBUG
           if (numBytes != sdPacket) {
             Serial.print("Warning: Incomplete SD write. ");
@@ -979,7 +923,7 @@ void loop() {
 
 #if DEBUG
         Serial.print("File closed!");
-        uint32_t filesize = file.fileSize(); // Get the file size
+        unsigned long filesize = file.fileSize(); // Get the file size
         Serial.print(" File size: "); Serial.print(filesize);
         Serial.print(". Expected file size: "); Serial.println(bytesWritten);
 #endif
@@ -989,7 +933,6 @@ void loop() {
       break;
 
     case SLEEP: {
-
 #if DEBUG
         Serial.println("Case: SLEEP");
 #endif
@@ -1015,17 +958,15 @@ void loop() {
       break;
 
     case WAKE: {
-
 #if DEBUG
         Serial.println("Case: WAKE");
 #endif
-
         // Check battery voltage
-        if (voltage > lowVoltage) {
+        if (readBattery() > lowVoltage) {
           loopStep = INIT;
         }
         else {
-          // Set alarm
+          // Go to deep sleep
           loopStep = SLEEP;
         }
       } // case WAKE
@@ -1054,6 +995,23 @@ void printAlarm() {
            (rtc.getAlarmYear() + 2000), rtc.getAlarmMonth(), rtc.getAlarmDay(),
            rtc.getAlarmHours(), rtc.getAlarmMinutes(), rtc.getAlarmSeconds());
   Serial.println(alarmBuffer);
+}
+
+// Read the battery voltageu
+float readBattery() {
+  voltage = 0.0;
+  for (byte i = 0; i < 10; ++i) {
+    voltage += analogRead(A7);
+    delay(1);
+  }
+  voltage /= 10;
+  voltage *= 2;
+  voltage *= 3.3;
+  voltage /= 4096;
+#if DEBUG
+  Serial.print("Voltage: "); Serial.print(voltage, 2); Serial.println("V");
+#endif
+  return voltage;
 }
 
 // Blink LED
@@ -1145,7 +1103,7 @@ void WDT_Handler() {
     while (1); // Force Watchdog Timer to reset the system
   }
 
-  // Increment the number of watchdog interrupts
+  // Increment number of Watchdog Timer interrupts
   watchdogCounter++;
 #if DEBUG
   Serial.print("watchdogCounter: "); Serial.println(watchdogCounter);
