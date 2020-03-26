@@ -1,5 +1,5 @@
 /*
-  Title:    ZED-F9P UBX Logger
+  Title:    ZED-F9P UBX-RAWX Logger
   Date:     March 26, 2020
   Author:   Adam Garbo
 
@@ -27,14 +27,14 @@
 // Debugging definitons
 #define DEBUG               true  // Output debug messages to Serial Monitor
 #define DEBUG_I2C           false  // Output I2C debug messages to Serial Monitor
-#define DEBUG_SERIAL_BUFFER false  // Output a message each time SerialBuffer.available reaches a new maximum
+#define DEBUG_SERIAL_BUFFER true  // Output a message each time SerialBuffer.available reaches a new maximum
 #define DEBUG_UBX           false  // Output UBX debug messages to Serial Monitor
 
 // LEDs
 #define LED_ON  true  // Enable LEDs
 #define LED_PIN 8     // Indicates that a GNSS fix has been established
 
-// Select alarm to set
+// Select alarm
 #define ALARM_MIN false // Enable rolling-minutes alarm
 #define ALARM_HR  false // Enable rolling-hours alarm
 #define ALARM_DAY true  // Enable rolling-day alarm
@@ -46,10 +46,10 @@ SdFile        file;
 SFE_UBLOX_GPS gnss; // I2C address: 0x42
 
 // User-declared global variables and constants
-const byte    alarmMinutes    = 10;     // Creates a new log file every alarmMinutes
-const byte    alarmHours      = 4;      // Creates a new log file every alarmHours
-const int     maxValFix       = 10;     // Minimum number of valid GNSS fixes to collect before beginning to log data
-const int     dwell           = 1100;   // How long to wait in msec for residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
+const byte    alarmMinutes    = 10;     // Create a new log file every alarmMinutes
+const byte    alarmHours      = 4;      // Create a new log file every alarmHours
+const int     maxFixCounter   = 10;     // Minimum number of valid GNSS fixes to collect before beginning to log data
+const int     dwell           = 1100;   // Delay in milliseconds to record residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
 const float   lowVoltage      = 3.5;    // Low battery voltage threshold
 
 // Global flag variable delcarations
@@ -59,14 +59,14 @@ volatile byte watchdogCounter = 0;      // Watchdog interrupt service routine co
 bool          ledState        = LOW;    // Flag to toggle LED in blinkLed() function
 bool          voltageFlag     = false;  // Flag to indiciate low battery voltage
 
-// Global variables and constant declarations
+// Global variable and constant declarations
 const byte    chipSelect      = 4;      // SD card chip select
 const size_t  sdPacket        = 512;    // SD card write packet size
 char          fileName[24]    = {0};    // Log file name. Limited to 8.3 characters. Format: YYYYMMDD/HHMMSS.ubx
 char          dirName[9]      = {0};    // Log file directory name. Format: YYYYMMDD
-int           numBytes        = 0;      // Not sure
+int           numBytes        = 0;      // Total number of bytes written to SD card
 int           maxSerialBuffer = 0;      // Maximum size of available SerialBuffer
-int           valFix          = 0;      // GNSS valid fix counter
+int           fixCounter      = 0;      // GNSS valid fix counter
 long          bytesWritten    = 0;      // SD card write byte counter
 float         voltage         = 0.0;    // Battery voltage
 uint8_t       serBuffer[sdPacket];      // Buffer for SD card writes
@@ -279,7 +279,7 @@ void setup() {
     digitalWrite(LED_PIN, LOW);
   }
 
-  // Configure the Watchdog Timer to perform a system reset if loop() blocks for more than 8-16 seconds
+  // Configure Watchdog Timer
   configureWatchdog();
 
   // Start Serial at 115200 baud
@@ -293,6 +293,9 @@ void setup() {
   // Initialize I2C
   Wire.begin();
   Wire.setClock(400000); // Increase clock frequency for I2C communications to 400 kHz
+
+  // Configure ADC
+  analogReadResolution(12); // Set ADC resolution to 12-bits
 
   // Initialize the RTC
   rtc.begin();
@@ -309,27 +312,23 @@ void setup() {
   }
 
   // Initialize the u-blox ZED-F9P
-  if (gnss.begin() == false) {
+  if (gnss.begin() == true) {
     Serial.println("u-blox ZED-F9P initialized.");
 #if DEBUG_I2C
     gnss.enableDebugging(); // Enable I2C debugging output to Serial Monitor
 #endif
   }
   else {
-    Serial.println("Warning: u-blox ZED-F9P not detected at default I2C address. Please check wiring. Halting!");
+    Serial.println("Warning: u-blox ZED-F9P not detected at default I2C address. Please check wiring.");
     digitalWrite(LED_BUILTIN, HIGH);
     digitalWrite(LED_PIN, HIGH);
     while (1); // Halt the program
   }
 
   // Configure u-blox ZED-F9P
-  // Messages:
   // Acknowledged:      "Received: CLS:5 ID:1 Payload: 6 8A" (UBX-ACK-ACK (0x05 0x01)
   // Not-Acknowledged:  UBX-ACK-NAK (0x05 0x00)
   // Payload:           UBX-CFG-VALSET (0x06 0x8A)
-
-  // These sendCommands will timeout as the commandAck checking in processUBXpacket expects the packet to be in packetCfg, not our custom packet!
-  // Turn on DEBUG to see if the commands are acknowledged (Received: CLS:ACK ID:1 Len: 0x2 Payload: 6 8A) or not acknowledged (CLS:5 ID:0)
   boolean setValueSuccess = true;
   setValueSuccess &= enableUart1Ubx();    // Enable UBX output protocol on UART1
   setValueSuccess &= enableI2cUbx();      // Enable UBX output protocol on I2C
@@ -363,7 +362,7 @@ void setup() {
   Serial.print("Current RTC date and time: "); printDateTime();
 
   // Wait for GNSS fix
-  Serial.println("Awaiting GNSS fix...");
+  Serial.println("Waiting for GNSS fix...");
 #endif
 }
 
@@ -377,7 +376,7 @@ void loop() {
         resetWatchdog();
 
 #if DEBUG
-        char gnssDateTime[24]; // GNSS date and time buffer
+        char gnssDateTime[24];
         snprintf(gnssDateTime, sizeof(gnssDateTime), "%04u-%02d-%02d %02d:%02d:%02d",
                  gnss.getYear(), gnss.getMonth(), gnss.getDay(),
                  gnss.getHour(), gnss.getMinute(), gnss.getSecond());
@@ -404,7 +403,7 @@ void loop() {
 #if LED_ON
           digitalWrite(LED_PIN, HIGH); // Turn LED ON to indicate GNSS fix
 #endif
-          valFix++; // Increment counter
+          fixCounter++; // Increment counter
         }
         else {
 #if LED_ON
@@ -413,9 +412,8 @@ void loop() {
         }
 
         // Have enough valid GNSS fixes been collected?
-        if (valFix == maxValFix) {
-
-          valFix = 0; // Reset counter
+        if (fixCounter == maxFixCounter) {
+          fixCounter = 0; // Reset counter
 
           // Set the RTC's date and time
           rtc.setTime(gnss.getHour(), gnss.getMinute(), gnss.getSecond());    // Set the time
@@ -1000,7 +998,7 @@ void printAlarm() {
 // Read the battery voltageu
 float readBattery() {
   voltage = 0.0;
-  for (byte i = 0; i < 10; ++i) {
+  for (byte i = 0; i < 5; ++i) {
     voltage += analogRead(A7);
     delay(1);
   }
@@ -1009,7 +1007,7 @@ float readBattery() {
   voltage *= 3.3;
   voltage /= 4096;
 #if DEBUG
-  Serial.print("Voltage: "); Serial.print(voltage, 2); Serial.println("V");
+  //Serial.print("Voltage: "); Serial.print(voltage, 2); Serial.println("V");
 #endif
   return voltage;
 }
@@ -1088,7 +1086,7 @@ void disableWatchdog() {
 
 // Watchdog Timer interrupt service routine
 void WDT_Handler() {
-  // Permit a limited number of Watchdog Timer interrupts before resetting the system
+  // Permit a number of Watchdog Timer interrupts before resetting the system
   if (watchdogCounter < 10) {
     WDT->INTFLAG.bit.EW = 1;          // Clear the Early Warning interrupt flag //REG_WDT_INTFLAG = WDT_INTFLAG_EW;
     WDT->CLEAR.bit.CLEAR = 0xA5;      // Clear the Watchdog Timer and restart time-out period //REG_WDT_CLEAR = WDT_CLEAR_CLEAR_KEY;
