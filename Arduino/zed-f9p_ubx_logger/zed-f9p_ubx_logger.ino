@@ -4,7 +4,8 @@
   Author:   Adam Garbo
 
   Description:
-  - Logs UBX-RXM-RAWX and UBX-RXM-SFRBX data from u-blox ZED-F9P GNSS receiver to SD card
+  - u-blox ZED-F9P data logger
+  - Logs UBX-RXM-RAWX and UBX-RXM-SFRBX messages to SD card
 
   Components:
   - Adafruit Feather M0 Adalogger
@@ -13,7 +14,8 @@
   Comments:
   - This code is based on Paul Clark's F9P_RAWX_Logger:
   https://github.com/PaulZC/ZED-F9P_FeatherWing_USB
-  - Added functionality includes rolling alarms and Watchdog Timer
+  - Added functionality includes Watchdog Timer, rolling alarms and
+  streamlined code for logging UBX messages.
 */
 
 // Libraries
@@ -108,7 +110,7 @@ ParseSwitch parseStep = PARSE_UBX_SYNC_CHAR_1;
 
 // Definitions for u-blox F9P UBX-format (binary) messages
 
-// Satellite systems (GNSS) signal configuration. Enable GPS/GLO and disable GAL/BDS/QZSS. Warning: Will cause receiver reset!
+// Satellite systems (GNSS) signal configuration. Enable GPS/GLO and disable GAL/BDS/QZSS.
 uint8_t configureGnss() {
   gnss.newCfgValset8(0x1031001f, 0x01, VAL_LAYER_RAM); // CFG-SIGNAL-GPS_ENA
   gnss.addCfgValset8(0x10310001, 0x01);                // CFG-SIGNAL-GPS_L1CA_ENA
@@ -152,6 +154,7 @@ uint8_t enableUbx() {
   gnss.newCfgValset8(0x209102a5, 0x01, VAL_LAYER_RAM); // CFG-MSGOUT-UBX_RXM_RAWX_UART1
   return gnss.sendCfgValset8(0x20910232, 0x01);        // CFG-MSGOUT-UBX_RXM_SFRBX_UART1
 }
+
 // Disable UBX-RXM-RAWX and UBX-RXM-SFRBX messages on UART1
 uint8_t disableUbx() {
   gnss.newCfgValset8(0x209102a5, 0x00, VAL_LAYER_RAM); // CFG-MSGOUT-UBX_RXM_RAWX_UART1
@@ -186,11 +189,10 @@ uint8_t disableTP1() {
   return gnss.setVal32(0x40050005, 0x00, VAL_LAYER_RAM); // CFG-TP-LEN_LOCK_TP1
 }
 
-// Define SerialBuffer as a large RingBuffer which we will use to store the Serial1 receive data
-// Actual Serial1 receive data will be copied into SerialBuffer by a timer interrupt
+// Define SerialBuffer as a large RingBuffer to store Serial1 data using the TC3 timer interrupt
 // https://gist.github.com/jdneo/43be30d85080b175cb5aed3500d3f989
-// That way, we do not need to increase the size of the Serial1 receive buffer (by editing RingBuffer.h)
-// You can use DEBUG_SERIAL_BUFFER to determine how big the buffer should be. Increase it if you see bufAvail get close to or reach the buffer size.
+// This prevents needing to increase the size of Serial1 receive buffer by editing RingBuffer.h
+// Use DEBUG_SERIAL_BUFFER to determine the appropriate size of the buffer.
 RingBufferN<16384> SerialBuffer; // Define SerialBuffer as a RingBuffer of size 16k bytes
 
 // TimerCounter3 functions to copy Serial1 receive data into SerialBuffer
@@ -234,7 +236,7 @@ void startTimerInterval(float intervalS) {
 
   setTimerInterval(intervalS);
 
-  // Enable the compare interruptl
+  // Enable the compare interrupt
   TC->INTENSET.reg = 0;
   TC->INTENSET.bit.MC0 = 1;
 
@@ -325,7 +327,7 @@ void setup() {
     while (1); // Halt the program
   }
 
-  // Configure u-blox ZED-F9P
+  // u-blox ZED-F9P Configuration
   // Acknowledged:      "Received: CLS:5 ID:1 Payload: 6 8A" (UBX-ACK-ACK (0x05 0x01)
   // Not-Acknowledged:  UBX-ACK-NAK (0x05 0x00)
   // Payload:           UBX-CFG-VALSET (0x06 0x8A)
@@ -517,8 +519,8 @@ void loop() {
         }
 
         bytesWritten = 0;                   // Clear bytesWritten
-        parseStep = PARSE_UBX_SYNC_CHAR_1;  // Set parseStep to expect 0xB5 or '$'
         ubxLength = 0;                      // Set ubxLength to zero
+        parseStep = PARSE_UBX_SYNC_CHAR_1;  // Set parseStep to expect 0xB5
 
         // Begin logging data
         loopStep = WRITE_FILE;
@@ -577,8 +579,6 @@ void loop() {
           // Example:     B5 62 02 15 0010 4E621058395C5C40000012000101C6BC 06 00
 
           // Process data bytes according to parseStep switch statement
-          // Only allow a new file to be opened when a complete packet has been processed and parseStep
-          // has returned to "PARSE_UBX_SYNC_CHAR_1" or when a data error is detected (i.e. SYNC_LOST)
           switch (parseStep) {
             case (PARSE_UBX_SYNC_CHAR_1): {
                 if (c == 0xB5) {
@@ -673,7 +673,6 @@ void loop() {
                 }
               }
               break;
-
           }
         }
         else {
@@ -824,8 +823,7 @@ void loop() {
           Serial.print("Final SD write: "); Serial.print(bufferPointer);
           Serial.print(" bytes. Total bytes written: "); Serial.println(bytesWritten);
 #endif
-          // Reset bufferPointer
-          bufferPointer = 0;
+          bufferPointer = 0; // Reset bufferPointer
         }
 
         // Set the log file's last write/modification date and time
@@ -857,11 +855,9 @@ void loop() {
 #if DEBUG
         Serial.println("RESTART_FILE");
 #endif
-        // Pet the dog
-        resetWatchdog();
+        resetWatchdog(); // Pet the dog
 
-        // Disable UBX messages
-        disableUbx();
+        disableUbx(); // Disable UBX messages
 
         int waitcount = 0;
         // Wait for residual data
@@ -888,9 +884,9 @@ void loop() {
           waitcount++;
           delay(1);
         }
-        // If there is any data left in serBuffer, write it to file
+        // Write any remaining data in serBuffer to file
         if (bufferPointer > 0) {
-          numBytes = file.write(&serBuffer, bufferPointer); // Write remaining data
+          numBytes = file.write(&serBuffer, bufferPointer);
           file.sync(); // Sync the file system
           bytesWritten += bufferPointer;
           blinkLed(1, 50); // Blink LED to indicate SD card write
@@ -997,15 +993,7 @@ void printAlarm() {
 
 // Read the battery voltageu
 float readBattery() {
-  voltage = 0.0;
-  for (byte i = 0; i < 5; ++i) {
-    voltage += analogRead(A7);
-    delay(1);
-  }
-  voltage /= 10;
-  voltage *= 2;
-  voltage *= 3.3;
-  voltage /= 4096;
+  voltage = analogRead(A7) * (2.0 * 3.3 / 4096.0);
 #if DEBUG
   //Serial.print("Voltage: "); Serial.print(voltage, 2); Serial.println("V");
 #endif
