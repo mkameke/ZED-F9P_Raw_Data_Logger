@@ -58,8 +58,9 @@ void loop() {
 
     // See issue: https://github.com/sparkfun/SparkFun_Ublox_Arduino_Library/issues/37
     if (lsb == 0x7F) {
-      bytesAvailable = 0;
+      //bytesAvailable = 0;
     }
+
     // See issue: https://github.com/sparkfun/SparkFun_Ublox_Arduino_Library/issues/38
     if (lsb == 0xFF) {
       bytesAvailable = 0;
@@ -101,6 +102,7 @@ TRY_AGAIN:
     // Sync every >512 bytes
     if (bufferPointer > 512) {
       digitalWrite(LED_BUILTIN, HIGH);
+      //myLog.write(i2cBuffer, bufferPointer); // Not working
       for (uint16_t i = 0; i < bufferPointer; i++)
         myLog.write(i2cBuffer[i]);
       myLog.syncFile();
