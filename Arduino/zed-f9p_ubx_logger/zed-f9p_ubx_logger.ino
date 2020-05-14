@@ -1,6 +1,6 @@
 /*
   Title:    ZED-F9P UBX-RAWX Logger
-  Date:     March 26, 2020
+  Date:     May 13, 2020
   Author:   Adam Garbo
 
   Description:
@@ -29,7 +29,7 @@
 // Debugging definitons
 #define DEBUG               true  // Output debug messages to Serial Monitor
 #define DEBUG_I2C           false  // Output I2C debug messages to Serial Monitor
-#define DEBUG_SERIAL_BUFFER true  // Output a message each time SerialBuffer.available reaches a new maximum
+#define DEBUG_SERIAL_BUFFER false  // Output a message each time SerialBuffer.available reaches a new maximum
 #define DEBUG_UBX           false  // Output UBX debug messages to Serial Monitor
 
 // LEDs
@@ -48,11 +48,11 @@ SdFile        file;
 SFE_UBLOX_GPS gnss; // I2C address: 0x42
 
 // User-declared global variables and constants
-const byte    alarmMinutes    = 10;     // Create a new log file every alarmMinutes
+const byte    alarmMinutes    = 5;     // Create a new log file every alarmMinutes
 const byte    alarmHours      = 4;      // Create a new log file every alarmHours
 const int     maxFixCounter   = 10;     // Minimum number of valid GNSS fixes to collect before beginning to log data
 const int     dwell           = 1100;   // Delay in milliseconds to record residual UBX data before closing log file (e.g. 1Hz = 1000 ms, so 1100 ms is slightly more than one measurement interval)
-const float   lowVoltage      = 3.5;    // Low battery voltage threshold
+const float   lowVoltage      = 3.3;    // Low battery voltage threshold
 
 // Global flag variable delcarations
 volatile bool alarmFlag       = false;  // RTC alarm interrupt service routine flag
@@ -185,7 +185,7 @@ uint8_t setNavStationary() {
 
 // 'Disable' timepulse TP1 by setting LEN_LOCK_TP1 to zero
 // (This doesn't actually disable the timepulse, it just sets its length to zero!)
-uint8_t disableTP1() {
+uint8_t disableTp1() {
   return gnss.setVal32(0x40050005, 0x00, VAL_LAYER_RAM); // CFG-TP-LEN_LOCK_TP1
 }
 
@@ -288,7 +288,8 @@ void setup() {
   Serial.begin(115200);
   //while (!Serial);    // Wait for user to open Serial Monitor
   delay(5000);       // Delay to allow user to open Serial Monitor
-
+ 
+  Serial.println("-----------------------------");
   Serial.println("u-blox ZED-F9P Raw Datalogger");
   Serial.println("-----------------------------");
 
@@ -353,7 +354,7 @@ void setup() {
   }
 
 #if !LED_ON
-  disableTP1(); // Disable the timepulse to prevent the LED from flashing
+  disableTp1(); // Disable the timepulse to prevent the LED from flashing
 #endif
 
   // Start Serial1 at 230400 baud
